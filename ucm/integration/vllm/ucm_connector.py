@@ -316,6 +316,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.layer_name_to_id = {
             name: self._extract_layer_index(name) for name in self.kv_caches.keys()
         }
+        self.last_layer_name = list(self.layer_name_to_id.keys())[-1]
 
         self.store = self._create_store(self.kv_cache_layout)
 
@@ -652,6 +653,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self.dump_tasks: dict[str, Task] = {}
         self.use_layerwise = True
         self.is_save = False
+        self.pre_layer_name = None
+        self.pre_layer_data = None
         logger.info("Init UCMLayerWiseConnector.")
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -681,8 +684,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        metadata = self._get_connector_metadata()
+        if self.pre_layer_name:
+            p_kv, p_meta, p_kwargs = self.pre_layer_data
+            self._dump_kv_layer(self.pre_layer_name, p_kv, p_meta, **p_kwargs)
+            self.pre_layer_name = None
+            self.pre_layer_data = None
 
+        metadata = self._get_connector_metadata()
         for request_id, tasks in self.load_tasks.items():
             try:
                 if layer_name in tasks:
@@ -703,7 +711,19 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         # TODO support PP
         if self.is_mla and self.tp_rank != 0:
             return
+        if layer_name != self.last_layer_name:
+            self.pre_layer_name = layer_name
+            self.pre_layer_data = (kv_layer, attn_metadata, kwargs)
+            return
+        self._dump_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
+    def _dump_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
