@@ -82,6 +82,7 @@ void TransQueue::LoadWorker(IoUnit& ios)
 
 void TransQueue::DumpWorker(IoUnit& ios)
 {
+
     if (ios.firstIo) {
         auto wait = NowTime::Now() - ios.waiter->startTp;
         UC_DEBUG("Posix dump task({}) start running, wait {:.3f}ms.", ios.owner, wait * 1e3);

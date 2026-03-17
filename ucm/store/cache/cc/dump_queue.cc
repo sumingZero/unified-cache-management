@@ -98,6 +98,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
             return s;
         }
     }
+    stream.Synchronize();
+    auto dump_start_tp = NowTime::Now();
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[i];
         auto handle = buffer_->Get(shard.owner, shard.index);
@@ -116,6 +118,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     auto tpMakeBuffer = NowTime::Now();
     if (backendTaskDesc.empty()) { return Status::OK(); }
     auto s = stream.Synchronize();
+    auto dump_end_tp = NowTime::Now();
+    UC_INFO("Cache task({},{},{}) dump data cost {:.3f}ms.", task->id, task->desc.brief, task->desc.size(), (dump_end_tp - dump_start_tp) * 1e3);
     if (s.Failure()) [[unlikely]] {
         UC_ERROR("Failed({}) to sync on stream for task({}).", s, task->id);
         return s;

@@ -130,6 +130,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
     do {
         s = WaitBackendTaskReady(task);
         if (s.Failure()) [[unlikely]] { break; }
+        auto tp = NowTime::Now();
         s = HostToDeviceScatterAsync(stream.NextStream(), task.bufferHandle.Data(),
                                      task.shard.addrs.data());
         if (s.Failure()) [[unlikely]] {
@@ -141,6 +142,8 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
             return;
         }
         s = stream.Synchronize();
+        auto cost = NowTime::Now() - tp;
+        UC_INFO("Cache load task({}) cost {:.3f}ms.", task.taskHandle, cost * 1e3);
         holder_.clear();
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to sync on stream for task({}).", s, task.taskHandle);

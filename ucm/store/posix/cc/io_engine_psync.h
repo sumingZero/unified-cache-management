@@ -53,7 +53,7 @@ protected:
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);
         w->SetEpilog([id, brief = std::move(brief), num, size, tp] {
             auto cost = NowTime::Now() - tp;
-            UC_DEBUG("Posix task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
+            UC_INFO("Posix task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
                      cost * 1e3);
         });
         queue_.Push(t, w);

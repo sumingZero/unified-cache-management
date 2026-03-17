@@ -324,6 +324,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
+        uc_lookup_time_start = time.perf_counter() * 1000
         assert num_computed_tokens % self.block_size == 0
         hbm_hit_block_num = num_computed_tokens // self.block_size
 
@@ -335,7 +336,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if not external_block_ids:
             return 0, False
         try:
+            cachestore_lookup_time_start = time.perf_counter() * 1000
             external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
+            cachestore_lookup_time_end = time.perf_counter() * 1000
+            logger.info("request_id: {}, cachestore_lookup_time: {:.3f}ms".format(request.request_id, cachestore_lookup_time_end - cachestore_lookup_time_start))
         except RuntimeError as e:
             external_hit_blocks = 0
             logger.error(f"request {request.request_id} look up error. {e}")
@@ -368,7 +372,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
         )
-
+        uc_lookup_time_end = time.perf_counter() * 1000
+        logger.info("request_id: {}, uc_lookup_time: {:.3f}ms".format(request.request_id, uc_lookup_time_end - uc_lookup_time_start))
         return external_hit_tokens, False
 
     def update_state_after_alloc(
@@ -675,6 +680,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
+        uc_load_time_start = time.perf_counter() * 1000
 
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
@@ -697,6 +703,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
+        uc_load_time_end = time.perf_counter() * 1000
+        logger.info("start_load_kv time: {:.3f}ms".format(uc_load_time_end - uc_load_time_start))
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         metadata = self._get_connector_metadata()
@@ -721,7 +729,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         # TODO support PP
         if self.is_mla and self.tp_rank != 0:
             return
-
+        uc_save_time_start = time.perf_counter() * 1000
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
@@ -750,6 +758,8 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self.dump_tasks[layer_name] = task
             except RuntimeError as e:
                 logger.error(f"submit dump task failed. {e}")
+        uc_save_time_end = time.perf_counter() * 1000
+        print("layer_name: {}, uc_save_time: {:.3f}ms".format(layer_name, uc_save_time_end - uc_save_time_start))
 
     def wait_for_save(self) -> None:
         if not self.is_save:

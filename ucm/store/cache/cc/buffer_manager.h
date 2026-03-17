@@ -41,7 +41,7 @@ class BufferManager {
         StopWatch sw;
         auto res = (backend_->*LookupFunc)(blocks, num);
         if (!res) [[unlikely]] { return decltype(res)(res.Error()); }
-        UC_DEBUG("Cache lookup({}) in backend costs {:.3f}ms.", num, sw.Elapsed().count() * 1e3);
+        UC_INFO("Cache lookup({}) in backend costs {:.3f}ms.", num, sw.Elapsed().count() * 1e3);
         return res;
     }
 
@@ -84,7 +84,7 @@ private:
             missBlk.push_back(blocks[i]);
             missIdx.push_back(i);
         }
-        UC_DEBUG("Cache lookup({}) costs {:.3f}ms.", num, sw.Elapsed().count() * 1e3);
+        UC_INFO("Cache lookup({}) costs {:.3f}ms.", num, sw.Elapsed().count() * 1e3);
     }
     Expected<std::vector<uint8_t>> LookupFast(const Detail::BlockId* blocks, size_t num)
     {
@@ -96,7 +96,7 @@ private:
         StopWatch sw;
         auto res = backend_->Lookup(missBlk.data(), missBlk.size());
         if (!res) [[unlikely]] { return res.Error(); }
-        UC_DEBUG("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
+        UC_INFO("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
                  sw.Elapsed().count() * 1e3);
         const auto& backendVec = res.Value();
         for (size_t i = 0; i < missIdx.size(); ++i) { results[missIdx[i]] = backendVec[i]; }
@@ -112,7 +112,7 @@ private:
         StopWatch sw;
         auto res = backend_->LookupOnPrefix(missBlk.data(), missBlk.size());
         if (!res) [[unlikely]] { return res.Error(); }
-        UC_DEBUG("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
+        UC_INFO("Cache lookup({}/{}) in backend costs {:.3f}ms.", missBlk.size(), num,
                  sw.Elapsed().count() * 1e3);
         const auto& result = res.Value();
         if (static_cast<size_t>(result + 1) == missIdx.size()) {
