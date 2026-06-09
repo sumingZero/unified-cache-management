@@ -41,7 +41,7 @@ ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "0").lower() in (
     "on",
 )
 ENABLE_UCM_PATCH = os.environ.get("ENABLE_UCM_PATCH", "").lower() in ("1", "true")
-
+VLLM_CPU_AFFINITY = os.getenv("VLLM_CPU_AFFINITY") == "1"
 
 def _read_vllm_ascend_version_raw() -> Optional[str]:
     """Read vllm_ascend version string, stripping only build metadata (+xxx)."""
@@ -122,6 +122,10 @@ def apply_all_patches() -> None:
     version: Optional[str] = None
     try:
         from ucm.integration.vllm.patch.logger_patch import patch_logger
+
+        if VLLM_CPU_AFFINITY:
+            import ucm.integration.vllm.patch.cpu_binding_patch
+            logger.info("UCM patching vllm-ascend cpu_binding for UCM thread isolation...")
 
         if not ENABLE_UCM_PATCH:
             return

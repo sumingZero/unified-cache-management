@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "aio_impl.h"
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
@@ -150,6 +151,7 @@ Status AioImpl::WriteAsync(Io&& io)
 
 void AioImpl::CompletionLoop()
 {
+    pthread_setname_np(pthread_self(), "ucm_posix_aio");
     std::vector<epoll_event> epollEvents(128);
     std::vector<io_event> aioEvents(batchCompleteSize);
     while (!stop_) {
