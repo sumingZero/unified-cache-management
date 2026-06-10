@@ -29,6 +29,7 @@
 #include <functional>
 #include <future>
 #include <list>
+#include <pthread.h>
 #include <memory>
 #include <mutex>
 #include <sys/syscall.h>
@@ -198,6 +199,7 @@ private:
     }
     void WorkerLoop(std::promise<bool>& prom, std::shared_ptr<Worker> worker)
     {
+        pthread_setname_np(pthread_self(), "ucm_pool_wkr");
         worker->tid = syscall(SYS_gettid);
         WorkerArgs args = nullptr;
         auto success = true;
@@ -230,6 +232,7 @@ private:
 
     void MonitorLoop()
     {
+        pthread_setname_np(pthread_self(), "ucm_pool_mon");
         if (!cpuAffinityCores_.empty()) {
             CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         }

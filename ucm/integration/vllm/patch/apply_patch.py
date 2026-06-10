@@ -42,7 +42,6 @@ ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "0").lower() in (
 )
 ENABLE_UCM_PATCH = os.environ.get("ENABLE_UCM_PATCH", "").lower() in ("1", "true")
 
-
 def _read_vllm_ascend_version_raw() -> Optional[str]:
     """Read vllm_ascend version string, stripping only build metadata (+xxx)."""
 
@@ -114,7 +113,7 @@ def get_vllm_version() -> Optional[str]:
 
 def get_supported_versions() -> list[str]:
     """Get patch-required vLLM versions."""
-    return ["0.11.0", "0.17.0", "0.18.0", "0.19.0"]
+    return ["0.11.0", "0.17.0", "0.18.0", "0.19.1"]
 
 
 def apply_all_patches() -> None:
@@ -125,6 +124,11 @@ def apply_all_patches() -> None:
 
         if not ENABLE_UCM_PATCH:
             return
+
+        ascend_version = get_vllm_ascend_version()
+        if ascend_version and ascend_version >= "0.19.0":
+            import ucm.integration.vllm.patch.cpu_binding_patch
+            logger.info("UCM patching vllm-ascend cpu_binding for UCM thread isolation...")
 
         version = get_vllm_version()
         if version is None:
@@ -154,7 +158,6 @@ def apply_all_patches() -> None:
                 pass
 
         # vllm_ascend patches
-        ascend_version = get_vllm_ascend_version()
         match ascend_version:
             case "0.11.0":
                 logger.info("UCM patching vllm-ascend for pc...")
@@ -166,7 +169,7 @@ def apply_all_patches() -> None:
             case "0.18.0":
                 logger.info("UCM patching vllm-ascend for pc...")
                 import ucm.integration.vllm.patch.v0180.vllm_ascend.pc_ascend_patch
-            case "0.17.0" | "0.19.0":
+            case "0.17.0" | "0.19.1":
                 logger.info(f"UCM patching vllm-ascend {ascend_version} for pc...")
                 import ucm.integration.vllm.patch.v0180.vllm_ascend.ucm_connector_patch
             case _:

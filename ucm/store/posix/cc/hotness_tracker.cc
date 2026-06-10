@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "hotness_tracker.h"
+#include <pthread.h>
 #include <utime.h>
 #include "logger/logger.h"
 
@@ -53,6 +54,7 @@ void HotnessTracker::Touch(const Detail::BlockId& blockId)
 
 void HotnessTracker::UtimeWorkerLoop()
 {
+    pthread_setname_np(pthread_self(), "ucm_posix_ut");
     std::deque<Detail::BlockId> consumeQueue;
     constexpr size_t kSpinLimit = 16;
     size_t spinCount = 0;

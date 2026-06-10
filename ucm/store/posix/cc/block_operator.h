@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <fcntl.h>
 #include <functional>
+#include <pthread.h>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -97,6 +98,7 @@ public:
 private:
     void OpenWorkerLoop()
     {
+        pthread_setname_np(pthread_self(), "ucm_posix_opn");
         constexpr const auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
         for (;;) {
             OpenTask task;
@@ -116,6 +118,7 @@ private:
     }
     void CommitWorkerLoop()
     {
+        pthread_setname_np(pthread_self(), "ucm_posix_cmt");
         for (;;) {
             CommitTask task;
             {

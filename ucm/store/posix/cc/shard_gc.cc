@@ -23,6 +23,7 @@
  * */
 #include "shard_gc.h"
 #include "logger/logger.h"
+#include <pthread.h>
 
 namespace UC::PosixStore {
 
@@ -83,6 +84,7 @@ void ShardGarbageCollector::StopBackgroundCheck()
 
 void ShardGarbageCollector::GCCheckLoop()
 {
+    pthread_setname_np(pthread_self(), "ucm_posix_gc");
     while (!stop_.load()) {
         auto [trigger, avgFilesPerShard, threshold] = ShouldTrigger();
         UC_INFO("GC sampling: avgFiles/shard={}, threshold={}, trigger={}", avgFilesPerShard,

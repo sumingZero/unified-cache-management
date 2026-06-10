@@ -25,6 +25,7 @@
 #include "logger/logger.h"
 #include "metrics_api.h"
 #include "thread/cpu_affinity.h"
+#include <pthread.h>
 
 namespace UC::CacheStore {
 
@@ -66,6 +67,7 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
 
 void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
+    pthread_setname_np(pthread_self(), "ucm_dump_disp");
     CopyStream stream;
     auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
@@ -175,6 +177,7 @@ Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream,
 
 void DumpQueue::BackendDumpStage()
 {
+    pthread_setname_np(pthread_self(), "ucm_dump_back");
     if (!cpuAffinityCores_.empty()) {
         auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
