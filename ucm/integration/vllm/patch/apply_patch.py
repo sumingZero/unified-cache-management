@@ -126,9 +126,9 @@ def apply_all_patches() -> None:
             return
 
         ascend_version = get_vllm_ascend_version()
-        if ascend_version and ascend_version >= "0.19.0":
-            import ucm.integration.vllm.patch.cpu_binding_patch
-            logger.info("UCM patching vllm-ascend cpu_binding for UCM thread isolation...")
+        # if ascend_version and ascend_version >= "0.19.0":
+        #     import ucm.integration.vllm.patch.cpu_binding_patch
+        #     logger.info("UCM patching vllm-ascend cpu_binding for UCM thread isolation...")
 
         version = get_vllm_version()
         if version is None:
