@@ -879,12 +879,35 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         # ranks and on rank-0 mamba positions not checked by the sequential
         # backward scan.
         if mamba_prefetch_hashes:
+            t0 = time.perf_counter()
             self.store.prefetch(mamba_prefetch_hashes)
+            t1 = time.perf_counter()
+            logger.info(
+                f"req {request.request_id} GC heat rank0 mamba prefetch: "
+                f"{(t1 - t0) * 1000:.2f}ms ({len(mamba_prefetch_hashes)} hashes)"
+            )
         total_hit_tokens = total_hit_block_num * lcm_block_size
         hbm_hit_full_attn = num_computed_tokens // primary_full_attn.block_size
         total_hit_full_attn = total_hit_tokens // primary_full_attn.block_size
         hit_full_attn_blocks = primary_block_ids[hbm_hit_full_attn:total_hit_full_attn]
-        self._prefetch_other_rank_hashes(hit_full_attn_blocks + mamba_prefetch_hashes)
+        prefetch_hashes = hit_full_attn_blocks + mamba_prefetch_hashes
+        if self._other_rank_hashers and prefetch_hashes:
+            t0 = time.perf_counter()
+            other_rank_block_ids = [
+                rank_hasher(block_id)
+                for rank_hasher in self._other_rank_hashers
+                for block_id in prefetch_hashes
+            ]
+            t1 = time.perf_counter()
+            if other_rank_block_ids:
+                self.store.prefetch(other_rank_block_ids)
+                t2 = time.perf_counter()
+                logger.info(
+                    f"req {request.request_id} GC heat other-rank: "
+                    f"rehash {(t1 - t0) * 1000:.2f}ms "
+                    f"({len(other_rank_block_ids)} hashes), "
+                    f"prefetch {(t2 - t1) * 1000:.2f}ms"
+                )
 
         logger.info_once(
             f"request_id: {request.request_id}, "
