@@ -77,6 +77,7 @@ Status AscendStream::DeviceToHost(void* device[], void* host, size_t size, size_
 Status AscendStream::DeviceToHostAsync(void* device, void* host, size_t size)
 {
     auto ret = aclrtMemcpyAsync(host, size, device, size, ACL_MEMCPY_DEVICE_TO_HOST, stream_);
+    UC_INFO("DIAG D2H aclrtMemcpyAsync: ret=%d, host=%p, device=%p, size=%zu", (int)ret, host, device, size);
     if (ret == ACL_SUCCESS) { return Status::OK(); }
     return Status{ret, std::to_string(ret)};
 }

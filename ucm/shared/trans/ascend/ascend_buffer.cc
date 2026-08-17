@@ -94,8 +94,10 @@ public:
             UC_ERROR("Failed to make host buffer({}).", size_);
             return nullptr;
         }
+        UC_INFO("DIAG HostHugePages: mmap ptr=%p, size=%zu, useGigantic=%d", buffer_, size_, useGiganticPages);
         std::memset(buffer_, 0, size_);
-        mlock(buffer_, size_);
+        auto mlockRet = mlock(buffer_, size_);
+        UC_INFO("DIAG HostHugePages: mlock ret=%d", mlockRet);
         auto s = Buffer::RegisterHostBuffer(buffer_, size_);
         if (s.Failure()) {
             UC_ERROR("Failed({}) to register buffer({}).", s, size_);
@@ -104,6 +106,7 @@ public:
             buffer_ = MAP_FAILED;
             return nullptr;
         }
+        UC_INFO("DIAG HostHugePages: RegisterHostBuffer OK, buffer=%p", buffer_);
         return std::shared_ptr<void>(buffer_, [self = shared_from_this()](auto) {});
     }
 };
@@ -120,6 +123,7 @@ std::shared_ptr<void> Trans::AscendBuffer::MakeHostBuffer(size_t size)
 {
     void* host = nullptr;
     auto ret = aclrtMallocHost(&host, size);
+    UC_INFO("DIAG MakeHostBuffer(aclrtMallocHost): ret=%d, host=%p, size=%zu", (int)ret, host, size);
     if (ret == ACL_SUCCESS) { return std::shared_ptr<void>(host, aclrtFreeHost); }
     return nullptr;
 }
@@ -137,11 +141,18 @@ Status Buffer::RegisterHostBuffer(void* host, size_t size, void** pDevice)
 {
     void* device = nullptr;
 #if ASCEND_SUPPORTS_REGISTER_PIN
+    UC_INFO("DIAG RegisterHostBuffer(V2): host=%p, size=%zu, pDevice=%p", host, size, pDevice);
     auto ret = aclrtHostRegisterV2(host, size, ACL_HOST_REG_MAPPED | ACL_HOST_REG_PINNED);
+    UC_INFO("DIAG aclrtHostRegisterV2: ret=%d", (int)ret);
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
-    if (pDevice) { ret = aclrtHostGetDevicePointer(host, &device, 0); }
+    if (pDevice) {
+        ret = aclrtHostGetDevicePointer(host, &device, 0);
+        UC_INFO("DIAG aclrtHostGetDevicePointer: ret=%d, device=%p", (int)ret, device);
+    }
 #else
+    UC_INFO("DIAG RegisterHostBuffer(V1): host=%p, size=%zu, pDevice=%p", host, size, pDevice);
     auto ret = aclrtHostRegister(host, size, ACL_HOST_REGISTER_MAPPED, &device);
+    UC_INFO("DIAG aclrtHostRegister: ret=%d, device=%p", (int)ret, device);
 #endif
     if (ret != ACL_SUCCESS) [[unlikely]] { return Status{ret, std::to_string(ret)}; }
     if (pDevice) { *pDevice = device; }

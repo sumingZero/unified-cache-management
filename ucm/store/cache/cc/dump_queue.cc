@@ -152,7 +152,9 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
                              static_cast<double>(backendTaskDesc.size()));
     if (backendTaskDesc.empty()) { return Status::OK(); }
     auto tpSyncStart = NowTime::Now();
+    UC_INFO("DIAG DumpOneTask: before Synchronize, task={}, shards={}, host={}", task->id, copiedShards, cacheSdmaDirect_ ? "device" : "host");
     auto s = stream.Synchronize();
+    UC_INFO("DIAG DumpOneTask: after Synchronize, ret={}, cost={:.3f}ms", s, (NowTime::Now() - tpSyncStart) * 1e3);
     if (s.Failure()) [[unlikely]] {
         UC_ERROR("Failed({}) to sync on stream for task({}).", s, task->id);
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);
