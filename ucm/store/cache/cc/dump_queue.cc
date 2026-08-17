@@ -92,10 +92,11 @@ void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
     auto& task = pair.first;
     auto& waiter = pair.second;
     auto wait = NowTime::Now() - waiter->startTp;
-    UC_DEBUG("Cache task({}) start running, wait {:.3f}ms.", task->id, wait * 1e3);
+    UC_INFO("DIAG DispatchOneTask: enter, task={}", task->id);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_dump_queue_wait_duration_ms"), wait * 1e3);
     if (!failureSet_->Contains(task->id)) {
         auto s = DumpOneTask(stream, task);
+        UC_INFO("DIAG DispatchOneTask: DumpOneTask returned ret={}", s);
         if (s.Failure()) [[unlikely]] {
             if (s == Status::StoreUnhealthy()) { task->Fail(s); }
             failureSet_->Insert(task->id);
@@ -110,7 +111,7 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     Detail::TaskDesc backendTaskDesc;
     backendTaskDesc.brief = "Cache2Backend";
     const auto nShard = task->desc.size();
-    UC_DEBUG("Try to dump ({}) shards.", nShard);
+    UC_INFO("DIAG DumpOneTask: enter, task={}, nShard={}", task->id, nShard);
     DumpCtx dumpCtx;
     dumpCtx.taskHandle = task->id;
     std::shared_ptr<std::atomic<double>> eventReadyTp;
@@ -130,11 +131,15 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     size_t copiedShards = 0;
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[i];
+        if (i == 0) { UC_INFO("DIAG DumpOneTask: before buffer_->Get, i=0, owner={}, index={}", shard.owner, shard.index); }
         auto handle = buffer_->Get(shard.owner, shard.index);
+        if (i == 0) { UC_INFO("DIAG DumpOneTask: after buffer_->Get, i=0, owner={}, ready={}", handle.Owner(), handle.Ready()); }
         if (!handle.Owner()) { continue; }
         if (!handle.Ready()) {
             auto* host = cacheSdmaDirect_ ? handle.DeviceData() : handle.Data();
+            if (i == 0) { UC_INFO("DIAG DumpOneTask: before DeviceToHostAsync, i=0, host={}", host); }
             auto s = DeviceToHostAsync(stream, shard.addrs.data(), host);
+            if (i == 0) { UC_INFO("DIAG DumpOneTask: after DeviceToHostAsync, i=0, ret={}", s); }
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to do D2H for task({}).", s, task->id);
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_d2h_errors_total"), 1.0);

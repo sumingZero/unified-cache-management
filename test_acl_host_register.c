@@ -21,6 +21,7 @@ static const char *ret_str(aclError ret) {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);
     aclError ret;
     double t0, t1;
 
