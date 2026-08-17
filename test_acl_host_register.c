@@ -25,14 +25,14 @@ int main() {
     double t0, t1;
 
     // ---- Init ----
-    ret = aclInit(nullptr);
+    ret = aclInit(NULL);
     printf("aclInit: %s\n", ret_str(ret));
 
     ret = aclrtSetDevice(0);
     printf("aclrtSetDevice: %s\n", ret_str(ret));
 
     // ---- Alloc device buffer ----
-    void *device = nullptr;
+    void *device = NULL;
     ret = aclrtMalloc(&device, BUF_SIZE, ACL_MEM_TYPE_HIGH_BAND_WIDTH);
     printf("aclrtMalloc(device): %s, ptr=%p\n", ret_str(ret), device);
 
@@ -45,7 +45,7 @@ int main() {
     // Test 1: aclrtMallocHost (known working path)
     //==============================================================
     printf("\n=== Test 1: aclrtMallocHost ===\n");
-    void *host1 = nullptr;
+    void *host1 = NULL;
     ret = aclrtMallocHost(&host1, BUF_SIZE);
     printf("aclrtMallocHost: ret=%s, ptr=%p\n", ret_str(ret), host1);
 
@@ -64,11 +64,11 @@ int main() {
     // Test 2: mmap anonymous + aclrtHostRegister (UCM SharedBuffer path)
     //==============================================================
     printf("\n=== Test 2: mmap(anon) + aclrtHostRegister ===\n");
-    void *host2 = mmap(nullptr, BUF_SIZE, PROT_READ | PROT_WRITE,
+    void *host2 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("mmap: ptr=%p\n", host2);
 
-    ret = aclrtHostRegister(host2, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, nullptr);
+    ret = aclrtHostRegister(host2, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, NULL);
     printf("aclrtHostRegister: ret=%s\n", ret_str(ret));
 
     memset(host2, 0xBB, BUF_SIZE);
@@ -87,18 +87,18 @@ int main() {
     // Test 3: mmap hugepage + aclrtHostRegister (UCM HostHugePages path)
     //==============================================================
     printf("\n=== Test 3: mmap(hugepage) + aclrtHostRegister ===\n");
-    void *host3 = mmap(nullptr, BUF_SIZE, PROT_READ | PROT_WRITE,
+    void *host3 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     if (host3 == MAP_FAILED) {
         printf("mmap(hugepage) failed, falling back to anon+MADV_HUGEPAGE\n");
-        host3 = mmap(nullptr, BUF_SIZE, PROT_READ | PROT_WRITE,
+        host3 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         madvise(host3, BUF_SIZE, MADV_HUGEPAGE);
     }
     printf("mmap: ptr=%p\n", host3);
 
     mlock(host3, BUF_SIZE);
-    ret = aclrtHostRegister(host3, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, nullptr);
+    ret = aclrtHostRegister(host3, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, NULL);
     printf("aclrtHostRegister: ret=%s\n", ret_str(ret));
 
     memset(host3, 0xCC, BUF_SIZE);
@@ -117,9 +117,9 @@ int main() {
     // Test 4: same as Test 2 but H2D direction
     //==============================================================
     printf("\n=== Test 4: mmap(anon) + aclrtHostRegister, H2D ===\n");
-    void *host4 = mmap(nullptr, BUF_SIZE, PROT_READ | PROT_WRITE,
+    void *host4 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ret = aclrtHostRegister(host4, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, nullptr);
+    ret = aclrtHostRegister(host4, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, NULL);
     printf("aclrtHostRegister: ret=%s\n", ret_str(ret));
 
     t0 = now_ms();
