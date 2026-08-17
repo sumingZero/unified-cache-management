@@ -393,11 +393,8 @@ protected:
             return s;
         }
         const auto dataSize = DataSize();
-        s = Trans::Buffer::RegisterHostBuffer((void*)data_, dataSize, (void**)&dataOnDevice_);
-        if (s.Failure()) [[unlikely]] {
-            UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, dataSize, deviceId);
-            return s;
-        }
+        UC_INFO("DIAG RegisterBuffer: skipping aclrtHostRegister, data={}, dataSize={}", (void*)data_, dataSize);
+        dataOnDevice_ = nullptr;
         return Status::OK();
     }
 

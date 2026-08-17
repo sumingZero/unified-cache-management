@@ -1,8 +1,11 @@
 #include <acl/acl.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -135,8 +138,96 @@ int main() {
     munmap(host4, BUF_SIZE);
 
     //==============================================================
-    // Cleanup
+    // Test 5: shm(MAP_SHARED) + aclrtHostRegister + non-NULL pDevice
+    //         (match UCM SharedBufferStrategy exactly, but 2MB size)
     //==============================================================
+    printf("\n=== Test 5: shm(MAP_SHARED) + pDevice, 2MB ===\n");
+    int shmFd = shm_open("/test_acl_shm", O_CREAT | O_RDWR, 0600);
+    if (shmFd < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto test6; }
+    ftruncate(shmFd, BUF_SIZE);
+    void *host5 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+    printf("shm mmap: ptr=%p\n", host5);
+    close(shmFd);
+
+    void *devPtr5 = NULL;
+    ret = aclrtHostRegister(host5, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr5);
+    printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr5);
+
+    memset(host5, 0xDD, BUF_SIZE);
+    t0 = now_ms();
+    ret = aclrtMemcpyAsync(host5, BUF_SIZE, device, BUF_SIZE,
+                           ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    printf("aclrtMemcpyAsync(D2H): ret=%s\n", ret_str(ret));
+    ret = aclrtSynchronizeStream(stream);
+    t1 = now_ms();
+    printf("aclrtSynchronizeStream: ret=%s, cost=%.3fms\n", ret_str(ret), t1 - t0);
+
+    aclrtHostUnregister(host5);
+    munmap(host5, BUF_SIZE);
+    shm_unlink("/test_acl_shm");
+
+test6:
+    //==============================================================
+    // Test 6: anon mmap + aclrtHostRegister + non-NULL pDevice
+    //         (only difference from Test 2 is pDevice)
+    //==============================================================
+    printf("\n=== Test 6: mmap(anon) + pDevice=&dev, 2MB ===\n");
+    void *host6 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *devPtr6 = NULL;
+    ret = aclrtHostRegister(host6, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr6);
+    printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr6);
+
+    memset(host6, 0xEE, BUF_SIZE);
+    t0 = now_ms();
+    ret = aclrtMemcpyAsync(host6, BUF_SIZE, device, BUF_SIZE,
+                           ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    printf("aclrtMemcpyAsync(D2H): ret=%s\n", ret_str(ret));
+    ret = aclrtSynchronizeStream(stream);
+    t1 = now_ms();
+    printf("aclrtSynchronizeStream: ret=%s, cost=%.3fms\n", ret_str(ret), t1 - t0);
+
+    aclrtHostUnregister(host6);
+    munmap(host6, BUF_SIZE);
+
+    //==============================================================
+    // Test 7: shm(MAP_SHARED) + aclrtHostRegister + non-NULL pDevice
+    //         large size (1GB) — closer to UCM's 32GB
+    //==============================================================
+    printf("\n=== Test 7: shm(MAP_SHARED) + pDevice, 1GB ===\n");
+    #define BIG_SIZE (1UL << 30)  // 1GB
+    int shmFd7 = shm_open("/test_acl_shm7", O_CREAT | O_RDWR, 0600);
+    if (shmFd7 < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto cleanup; }
+    ftruncate(shmFd7, BIG_SIZE);
+    void *host7 = mmap(NULL, BIG_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd7, 0);
+    printf("shm mmap: ptr=%p, size=%luMB\n", host7, BIG_SIZE >> 20);
+    close(shmFd7);
+
+    void *devPtr7 = NULL;
+    printf("calling aclrtHostRegister(1GB)...\n");
+    fflush(stdout);
+    t0 = now_ms();
+    ret = aclrtHostRegister(host7, BIG_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr7);
+    t1 = now_ms();
+    printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p, cost=%.3fms\n",
+           ret_str(ret), devPtr7, t1 - t0);
+
+    memset(host7, 0, BIG_SIZE);
+    printf("calling aclrtMemcpyAsync(1GB)...\n");
+    fflush(stdout);
+    t0 = now_ms();
+    ret = aclrtMemcpyAsync(host7, BIG_SIZE, device, BUF_SIZE,
+                           ACL_MEMCPY_DEVICE_TO_HOST, stream);
+    printf("aclrtMemcpyAsync(D2H): ret=%s\n", ret_str(ret));
+    ret = aclrtSynchronizeStream(stream);
+    t1 = now_ms();
+    printf("aclrtSynchronizeStream: ret=%s, cost=%.3fms\n", ret_str(ret), t1 - t0);
+
+    aclrtHostUnregister(host7);
+    munmap(host7, BIG_SIZE);
+    shm_unlink("/test_acl_shm7");
+
+cleanup:
     printf("\n=== Cleanup ===\n");
     aclrtDestroyStream(stream);
     aclrtFree(device);
