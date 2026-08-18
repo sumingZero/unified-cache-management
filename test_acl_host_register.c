@@ -42,6 +42,7 @@ static void *g_device;
 // Each test wrapped in: alarm + sigsetjmp
 // Catches: SIGSEGV (crash), SIGBUS (bus error), SIGALRM (timeout)
 #define TEST_BEGIN(name) \
+    { \
     printf("\n=== %s ===\n", name); fflush(stdout); \
     jmp_active = 1; \
     alarm(TEST_TIMEOUT); \
@@ -53,7 +54,8 @@ static void *g_device;
     else { printf("  [CRASHED: signal %d (%s)]\n", _sig, \
         _sig == SIGSEGV ? "SIGSEGV" : _sig == SIGBUS ? "SIGBUS" : "other"); } \
     alarm(0); \
-    jmp_active = 0;
+    jmp_active = 0; \
+    }
 
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
