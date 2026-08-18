@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #define BUF_SIZE (2 * 1024 * 1024)  // 2MB
+#define TEST_TIMEOUT 30  // seconds
 
 static double now_ms() {
     struct timespec ts;
@@ -25,41 +26,46 @@ static const char *ret_str(aclError ret) {
     return buf;
 }
 
-// --- Crash protection via sigsetjmp/siglongjmp ---
+// --- Crash + timeout protection ---
 static sigjmp_buf jmp_env;
 static volatile sig_atomic_t jmp_active = 0;
 
 static void crash_handler(int sig) {
-    (void)sig;
-    if (jmp_active) { siglongjmp(jmp_env, 1); }
-    // not in a test, abort
-    signal(SIGSEGV, SIG_DFL);
-    signal(SIGBUS, SIG_DFL);
+    if (jmp_active) { siglongjmp(jmp_env, sig); }
+    signal(sig, SIG_DFL);
     raise(sig);
 }
 
 static aclrtStream g_stream;
 static void *g_device;
 
-// Helper: run a test block with crash protection
-// Usage: SAFE_RUN { ...code... } while(0)
-//        prints [CRASHED] and continues if segfault
-#define SAFE_RUN(name) \
+// Each test wrapped in: alarm + sigsetjmp
+// Catches: SIGSEGV (crash), SIGBUS (bus error), SIGALRM (timeout)
+#define TEST_BEGIN(name) \
     printf("\n=== %s ===\n", name); fflush(stdout); \
     jmp_active = 1; \
-    if (sigsetjmp(jmp_env, 1) == 0)
+    alarm(TEST_TIMEOUT); \
+    int _sig = sigsetjmp(jmp_env, 1); \
+    if (_sig == 0)
+
+#define TEST_END() \
+    else if (_sig == SIGALRM) { printf("  [TIMEOUT - %ds]\n", TEST_TIMEOUT); } \
+    else { printf("  [CRASHED: signal %d (%s)]\n", _sig, \
+        _sig == SIGSEGV ? "SIGSEGV" : _sig == SIGBUS ? "SIGBUS" : "other"); } \
+    alarm(0); \
+    jmp_active = 0;
 
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     aclError ret;
 
-    // Install crash handlers
     struct sigaction sa;
     sa.sa_handler = crash_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
 
     ret = aclInit(NULL);
     printf("aclInit: %s\n", ret_str(ret));
@@ -73,7 +79,7 @@ int main() {
     //==============================================================
     // Test 1: aclrtMallocHost (baseline, no registration)
     //==============================================================
-    SAFE_RUN("Test 1: aclrtMallocHost") {
+    TEST_BEGIN("Test 1: aclrtMallocHost") {
         void *host = NULL;
         ret = aclrtMallocHost(&host, BUF_SIZE);
         printf("aclrtMallocHost: ret=%s, ptr=%p\n", ret_str(ret), host);
@@ -85,15 +91,12 @@ int main() {
         printf("aclrtSynchronizeStream: ret=%s, cost=%.3fms\n",
                ret_str(ret), now_ms() - t0);
         aclrtFreeHost(host);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 2: mmap(anon) + aclrtHostRegister(pDevice=NULL)
     //==============================================================
-    SAFE_RUN("Test 2: mmap(anon) + pDevice=NULL") {
+    TEST_BEGIN("Test 2: mmap(anon) + pDevice=NULL") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         printf("mmap: ptr=%p\n", host);
@@ -109,15 +112,12 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 3: mmap(hugepage) + aclrtHostRegister(pDevice=NULL)
     //==============================================================
-    SAFE_RUN("Test 3: mmap(hugepage) + pDevice=NULL") {
+    TEST_BEGIN("Test 3: mmap(hugepage) + pDevice=NULL") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (host == MAP_FAILED) {
@@ -140,15 +140,12 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 4: mmap(anon) + aclrtHostRegister(pDevice=NULL), H2D
     //==============================================================
-    SAFE_RUN("Test 4: mmap(anon) + pDevice=NULL, H2D") {
+    TEST_BEGIN("Test 4: mmap(anon) + pDevice=NULL, H2D") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         ret = aclrtHostRegister(host, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, NULL);
@@ -162,17 +159,14 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 5: shm(MAP_SHARED) + aclrtHostRegister(pDevice=&dev)
     //==============================================================
-    SAFE_RUN("Test 5: shm(MAP_SHARED) + pDevice=&dev") {
+    TEST_BEGIN("Test 5: shm(MAP_SHARED) + pDevice=&dev") {
         int fd = shm_open("/test_acl_shm5", O_CREAT | O_RDWR, 0600);
-        if (fd < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto t5_end; }
+        if (fd < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto t5_done; }
         ftruncate(fd, BUF_SIZE);
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         printf("shm mmap: ptr=%p\n", host);
@@ -180,10 +174,10 @@ int main() {
         void *devPtr = NULL;
         ret = aclrtHostRegister(host, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr);
         printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr);
-        printf("memset after register...\n");
-        fflush(stdout);
+        printf("memset after register...\n"); fflush(stdout);
         memset(host, 0xDD, BUF_SIZE);
         printf("memset OK\n");
+        printf("aclrtMemcpyAsync...\n"); fflush(stdout);
         double t0 = now_ms();
         ret = aclrtMemcpyAsync(host, BUF_SIZE, g_device, BUF_SIZE,
                                ACL_MEMCPY_DEVICE_TO_HOST, g_stream);
@@ -194,26 +188,23 @@ int main() {
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
         shm_unlink("/test_acl_shm5");
-    t5_end:;
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    t5_done:;
+    } TEST_END();
 
     //==============================================================
     // Test 6: mmap(anon) + aclrtHostRegister(pDevice=&dev), NO pre-memset
     //==============================================================
-    SAFE_RUN("Test 6: mmap(anon) + pDevice=&dev, no pre-memset") {
+    TEST_BEGIN("Test 6: mmap(anon) + pDevice=&dev, no pre-memset") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         printf("mmap: ptr=%p\n", host);
         void *devPtr = NULL;
         ret = aclrtHostRegister(host, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr);
         printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr);
-        printf("memset after register (pages NOT pre-faulted)...\n");
-        fflush(stdout);
+        printf("memset after register (pages NOT pre-faulted)...\n"); fflush(stdout);
         memset(host, 0xEE, BUF_SIZE);
         printf("memset OK\n");
+        printf("aclrtMemcpyAsync...\n"); fflush(stdout);
         double t0 = now_ms();
         ret = aclrtMemcpyAsync(host, BUF_SIZE, g_device, BUF_SIZE,
                                ACL_MEMCPY_DEVICE_TO_HOST, g_stream);
@@ -223,35 +214,29 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 7: shm(MAP_SHARED) + aclrtHostRegister(pDevice=&dev), 1GB
     //==============================================================
-    SAFE_RUN("Test 7: shm(MAP_SHARED) + pDevice=&dev, 1GB") {
+    TEST_BEGIN("Test 7: shm(MAP_SHARED) + pDevice=&dev, 1GB") {
         size_t bigSize = 1UL << 30;
         int fd = shm_open("/test_acl_shm7", O_CREAT | O_RDWR, 0600);
-        if (fd < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto t7_end; }
+        if (fd < 0) { printf("shm_open failed: %s\n", strerror(errno)); goto t7_done; }
         ftruncate(fd, bigSize);
         void *host = mmap(NULL, bigSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         printf("shm mmap: ptr=%p, size=%luMB\n", host, bigSize >> 20);
         close(fd);
         void *devPtr = NULL;
-        printf("calling aclrtHostRegister(1GB)...\n");
-        fflush(stdout);
+        printf("calling aclrtHostRegister(1GB)...\n"); fflush(stdout);
         double t0 = now_ms();
         ret = aclrtHostRegister(host, bigSize, ACL_HOST_REGISTER_MAPPED, &devPtr);
         printf("aclrtHostRegister: ret=%s, devPtr=%p, cost=%.3fms\n",
                ret_str(ret), devPtr, now_ms() - t0);
-        printf("memset after register...\n");
-        fflush(stdout);
+        printf("memset after register...\n"); fflush(stdout);
         memset(host, 0, BUF_SIZE);
         printf("memset OK\n");
-        printf("calling aclrtMemcpyAsync...\n");
-        fflush(stdout);
+        printf("aclrtMemcpyAsync...\n"); fflush(stdout);
         t0 = now_ms();
         ret = aclrtMemcpyAsync(host, BUF_SIZE, g_device, BUF_SIZE,
                                ACL_MEMCPY_DEVICE_TO_HOST, g_stream);
@@ -262,17 +247,14 @@ int main() {
         aclrtHostUnregister(host);
         munmap(host, bigSize);
         shm_unlink("/test_acl_shm7");
-    t7_end:;
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    t7_done:;
+    } TEST_END();
 
     //==============================================================
     // Test 8: mmap(anon) + pDevice=&dev + pre-memset + memcpy
     //         fault in ALL pages BEFORE register
     //==============================================================
-    SAFE_RUN("Test 8: mmap(anon) + pDevice=&dev + pre-memset + memcpy") {
+    TEST_BEGIN("Test 8: mmap(anon) + pDevice=&dev + pre-memset + memcpy") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         printf("mmap: ptr=%p\n", host);
@@ -283,6 +265,7 @@ int main() {
         printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr);
         memset(host, 0x22, BUF_SIZE);
         printf("memset after register: OK\n");
+        printf("aclrtMemcpyAsync...\n"); fflush(stdout);
         double t0 = now_ms();
         ret = aclrtMemcpyAsync(host, BUF_SIZE, g_device, BUF_SIZE,
                                ACL_MEMCPY_DEVICE_TO_HOST, g_stream);
@@ -292,26 +275,23 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Test 9: mmap(anon) + pDevice=&dev, NO pre-memset
-    //         (same as Test 6, to verify reproducibility)
+    //         (same as Test 6, verify reproducibility)
     //==============================================================
-    SAFE_RUN("Test 9: mmap(anon) + pDevice=&dev, no pre-memset") {
+    TEST_BEGIN("Test 9: mmap(anon) + pDevice=&dev, no pre-memset") {
         void *host = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         printf("mmap: ptr=%p\n", host);
         void *devPtr = NULL;
         ret = aclrtHostRegister(host, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr);
         printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr);
-        printf("memset after register (pages NOT pre-faulted)...\n");
-        fflush(stdout);
+        printf("memset after register (pages NOT pre-faulted)...\n"); fflush(stdout);
         memset(host, 0x33, BUF_SIZE);
         printf("memset OK\n");
+        printf("aclrtMemcpyAsync...\n"); fflush(stdout);
         double t0 = now_ms();
         ret = aclrtMemcpyAsync(host, BUF_SIZE, g_device, BUF_SIZE,
                                ACL_MEMCPY_DEVICE_TO_HOST, g_stream);
@@ -321,10 +301,7 @@ int main() {
                ret_str(ret), now_ms() - t0);
         aclrtHostUnregister(host);
         munmap(host, BUF_SIZE);
-    } else {
-        printf("  [CRASHED]\n");
-    }
-    jmp_active = 0;
+    } TEST_END();
 
     //==============================================================
     // Cleanup
