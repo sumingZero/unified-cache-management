@@ -228,6 +228,31 @@ test6:
     shm_unlink("/test_acl_shm7");
 
 cleanup:
+    //==============================================================
+    // Test 8: register with &devPtr, then ONLY memset (no ACL transfer)
+    //         If this segfaults, the problem is 100% in aclrtHostRegister
+    //         itself, not in aclrtMemcpyAsync.
+    //==============================================================
+    printf("\n=== Test 8: register + memset only (no memcpy) ===\n");
+    void *host8 = mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("mmap: ptr=%p\n", host8);
+    // write before register to confirm memory is accessible
+    memset(host8, 0x11, BUF_SIZE);
+    printf("memset before register: OK\n");
+
+    void *devPtr8 = NULL;
+    ret = aclrtHostRegister(host8, BUF_SIZE, ACL_HOST_REGISTER_MAPPED, &devPtr8);
+    printf("aclrtHostRegister(pDevice=&dev): ret=%s, devPtr=%p\n", ret_str(ret), devPtr8);
+
+    printf("memset after register (no memcpy involved)...\n");
+    fflush(stdout);
+    memset(host8, 0x22, BUF_SIZE);
+    printf("memset after register: OK\n");
+
+    aclrtHostUnregister(host8);
+    munmap(host8, BUF_SIZE);
+
     printf("\n=== Cleanup ===\n");
     aclrtDestroyStream(stream);
     aclrtFree(device);
