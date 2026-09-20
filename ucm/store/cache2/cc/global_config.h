@@ -23,8 +23,15 @@
  * */
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 namespace UC::Cache2 {
 
-class Config {};
+struct Config {
+    int32_t deviceId{-1};
+    size_t streamNumber{4};
+    size_t localRankSize{1};
+};
 
 }  // namespace UC::Cache2
