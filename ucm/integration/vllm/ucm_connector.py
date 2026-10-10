@@ -354,9 +354,15 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
-    # Keep this keyword-only so adding the optional async flag does not change
+    # Keep this keyword-only so adding the optional flag does not change
     # positional constructor semantics for connector-specific subclasses.
     load_async: bool = field(default=False, kw_only=True)
+    # All ucm_block_ids + vllm_block_ids for this request, regardless of
+    # whether load/dump is needed.  Used by the HBM checksum debug path
+    # to inspect HBM-resident data even on pure HBM-hit steps.
+    hbm_check_ids: tuple[list[bytes], list[int]] = field(
+        default_factory=lambda: ([], []), kw_only=True
+    )
 
 
 @dataclass(frozen=True)
@@ -716,6 +722,18 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
         scale_size: int = 0,
     ) -> list[list[KVCacheSegment]]:
         """Build fixed-width rows shared by CUDA and Ascend layouts."""
+        # Indexer KV cache is DCP-replicated: the tensor's first dimension
+        # is num_blocks × dcp_size, so each logical vllm_block_id spans
+        # dcp_size physical rows (each row = 128 tokens of indexer data).
+        # Both copy_size and block_stride must be scaled by dcp_size so
+        # that one vllm_block stores all dcp_size rows (the full 512-token
+        # indexer) in a single file, and consecutive vllm_blocks skip
+        # dcp_size rows.
+        dcp_size = getattr(
+            self.vllm_config.parallel_config,
+            "decode_context_parallel_size",
+            1,
+        )
         segment_rows = []
         for layer in layers:
             segments = [
@@ -724,35 +742,82 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
 
             if layout_mode == "bf16":
                 if layer.indexer is not None:
-                    segments.append(self._whole_tensor_segment(layer.indexer))
+                    seg = self._whole_tensor_segment(layer.indexer)
+                    if dcp_size > 1:
+                        seg = KVCacheSegment(
+                            ptr=seg.ptr,
+                            copy_size=seg.copy_size * dcp_size,
+                            block_stride=seg.block_stride * dcp_size,
+                            buffer_size=seg.buffer_size,
+                        )
+                    segments.append(seg)
                 else:
-                    segments.append(self._ghost_segment(indexer_size))
+                    ghost = self._ghost_segment(indexer_size)
+                    if dcp_size > 1:
+                        ghost = KVCacheSegment(
+                            ptr=0,
+                            copy_size=ghost.copy_size * dcp_size,
+                            block_stride=0,
+                            buffer_size=0,
+                        )
+                    segments.append(ghost)
             elif layout_mode == "li_c8":
                 if layer.scale is not None:
+                    idx_seg = self._whole_tensor_segment(layer.indexer)
+                    scale_seg = self._whole_tensor_segment(layer.scale)
+                    if dcp_size > 1:
+                        idx_seg = KVCacheSegment(
+                            ptr=idx_seg.ptr,
+                            copy_size=idx_seg.copy_size * dcp_size,
+                            block_stride=idx_seg.block_stride * dcp_size,
+                            buffer_size=idx_seg.buffer_size,
+                        )
+                        scale_seg = KVCacheSegment(
+                            ptr=scale_seg.ptr,
+                            copy_size=scale_seg.copy_size * dcp_size,
+                            block_stride=scale_seg.block_stride * dcp_size,
+                            buffer_size=scale_seg.buffer_size,
+                        )
                     segments.extend(
                         [
-                            self._whole_tensor_segment(layer.indexer),
-                            self._whole_tensor_segment(layer.scale),
+                            idx_seg,
+                            scale_seg,
                         ]
                     )
                 else:
-                    segments.extend(
-                        [
-                            self._ghost_segment(index_chunk_size),
-                            self._ghost_segment(scale_size),
-                        ]
-                    )
+                    g1 = self._ghost_segment(index_chunk_size)
+                    g2 = self._ghost_segment(scale_size)
+                    if dcp_size > 1:
+                        g1 = KVCacheSegment(ptr=0, copy_size=g1.copy_size * dcp_size, block_stride=0, buffer_size=0)
+                        g2 = KVCacheSegment(ptr=0, copy_size=g2.copy_size * dcp_size, block_stride=0, buffer_size=0)
+                    segments.extend([g1, g2])
             elif layout_mode == "mixed" and layer.scale is not None:
+                idx_stride = layer.indexer.bytes_per_block
+                idx_copy = index_chunk_size
+                if dcp_size > 1:
+                    idx_stride *= dcp_size
+                    idx_copy *= dcp_size
+                scale_seg = self._whole_tensor_segment(layer.scale)
+                if dcp_size > 1:
+                    scale_seg = KVCacheSegment(
+                        ptr=scale_seg.ptr,
+                        copy_size=scale_seg.copy_size * dcp_size,
+                        block_stride=scale_seg.block_stride * dcp_size,
+                        buffer_size=scale_seg.buffer_size,
+                    )
+                ghost = self._ghost_segment(index_chunk_size)
+                if dcp_size > 1:
+                    ghost = KVCacheSegment(ptr=0, copy_size=ghost.copy_size * dcp_size, block_stride=0, buffer_size=0)
                 segments.extend(
                     [
                         self._real_segment(
                             ptr=layer.indexer.ptr,
-                            copy_size=index_chunk_size,
-                            block_stride=layer.indexer.bytes_per_block,
+                            copy_size=idx_copy,
+                            block_stride=idx_stride,
                             buffer_size=layer.indexer.buffer_size,
                         ),
-                        self._ghost_segment(index_chunk_size),
-                        self._whole_tensor_segment(layer.scale),
+                        ghost,
+                        scale_seg,
                     ]
                 )
             elif layout_mode == "mixed" and layer.indexer is not None:
@@ -762,31 +827,40 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
                         f"segments: bf16_size={layer.indexer.bytes_per_block}, "
                         f"c8_size={index_chunk_size}."
                     )
+                idx_stride = layer.indexer.bytes_per_block
+                idx_copy = index_chunk_size
+                if dcp_size > 1:
+                    idx_stride *= dcp_size
+                    idx_copy *= dcp_size
+                ghost = self._ghost_segment(scale_size)
+                if dcp_size > 1:
+                    ghost = KVCacheSegment(ptr=0, copy_size=ghost.copy_size * dcp_size, block_stride=0, buffer_size=0)
                 segments.extend(
                     [
                         self._real_segment(
                             ptr=layer.indexer.ptr,
-                            copy_size=index_chunk_size,
-                            block_stride=layer.indexer.bytes_per_block,
+                            copy_size=idx_copy,
+                            block_stride=idx_stride,
                             buffer_size=layer.indexer.buffer_size,
                         ),
                         self._real_segment(
                             ptr=layer.indexer.ptr + index_chunk_size,
-                            copy_size=index_chunk_size,
-                            block_stride=layer.indexer.bytes_per_block,
+                            copy_size=idx_copy,
+                            block_stride=idx_stride,
                             buffer_size=0,
                         ),
-                        self._ghost_segment(scale_size),
+                        ghost,
                     ]
                 )
             elif layout_mode == "mixed":
-                segments.extend(
-                    [
-                        self._ghost_segment(index_chunk_size),
-                        self._ghost_segment(index_chunk_size),
-                        self._ghost_segment(scale_size),
-                    ]
-                )
+                g1 = self._ghost_segment(index_chunk_size)
+                g2 = self._ghost_segment(index_chunk_size)
+                g3 = self._ghost_segment(scale_size)
+                if dcp_size > 1:
+                    g1 = KVCacheSegment(ptr=0, copy_size=g1.copy_size * dcp_size, block_stride=0, buffer_size=0)
+                    g2 = KVCacheSegment(ptr=0, copy_size=g2.copy_size * dcp_size, block_stride=0, buffer_size=0)
+                    g3 = KVCacheSegment(ptr=0, copy_size=g3.copy_size * dcp_size, block_stride=0, buffer_size=0)
+                segments.extend([g1, g2, g3])
             else:
                 raise ValueError(
                     f"Unsupported Shared Indexer layout mode: {layout_mode}."
@@ -1621,6 +1695,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             config["tensor_size_list"] = tensor_size_list
             config["shard_size"] = store_shard_size
             config["block_size"] = store_block_size
+            self._store_shard_size = store_shard_size
             gc_block_size = _get_store_gc_block_size(
                 str(config.get("store_pipeline", "")),
                 tensor_size_list,
@@ -1743,6 +1818,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         if self.device is None:
             raise RuntimeError(f"Unsupported device platform for UCMDirectConnector.")
+
+        self._checksum_build_ptr_map(kv_caches)
 
     def _prefetch_all_rank_hashes(self, rank0_block_ids: list[bytes]) -> None:
         if not rank0_block_ids:
@@ -2056,9 +2133,22 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 )
                 dump_vllm_block_ids = dump_vllm_block_ids[: len(dump_ucm_block_ids)]
 
+        # hbm_check_ids: pass stride-sliced ucm + vllm block ids for HBM
+        # checksum debug, matching the same [dcp_rank::cp_world_size] slice
+        # applied to load/dump block ids.  Only include hit blocks.
+        check_end = total_hit_block_num
+        all_check_ucm = list(
+            ucm_block_ids[: check_end * self.cp_world_size]
+        )
+        all_check_vllm = list(vllm_block_ids[:check_end])
+        # Apply the same stride slice as bind_connector_metadata.
+        hbm_check_ucm = all_check_ucm[self.current_rank :: self.cp_world_size]
+        hbm_check_vllm = all_check_vllm
+
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
+            hbm_check_ids=(hbm_check_ucm, hbm_check_vllm),
         )
 
     def build_connector_meta(
@@ -2597,7 +2687,277 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._layerwise_layer_load_duration_sum_ms = 0.0
         self._layerwise_load_bytes = 0
         self._layerwise_save_bytes = 0
+        self._dcp_checksum_enabled = os.getenv("UCM_DCP_CHECKSUM_LOG", "0") == "1"
+        self._dcp_checksum_rank_filter = int(
+            os.getenv("UCM_DCP_CHECKSUM_RANK", "-1")
+        )
+        self._dump_checksums: dict[tuple[str, int], float] = {}
+        self._disk_checksums: dict[tuple[str, int], float] = {}
+        self._load_checksums: dict[tuple[str, int], float] = {}
+        self._ptr_to_tensor: dict[int, torch.Tensor] = {}
+        self._checksum_storage_backends: list[str] = []
+        self._store_shard_size: int = 0
+        self._hbm_entry_checksums: dict[tuple[str, int], list[float]] = {}
         logger.info("Init UCMLayerWiseConnector.")
+
+    # ── DCP checksum debug infrastructure ──────────────────────────────
+
+    def _checksum_build_ptr_map(self, kv_caches: dict) -> None:
+        """Build layer_id → list[tensor] mapping for HBM checksum reads."""
+        if not self._dcp_checksum_enabled:
+            return
+        self._ptr_to_tensor.clear()
+        # Build layer_id → list of tensors so we can index directly with
+        # vllm_block_id instead of doing address arithmetic.  Multiple
+        # kv_caches entries can map to the same layer_id (e.g. MLA attention
+        # + indexer), so we accumulate rather than overwrite.
+        self._layer_id_tensors: dict[int, list[torch.Tensor]] = {}
+        for layer_name, kv in kv_caches.items():
+            lid = self.layer_name_to_id.get(layer_name)
+            if lid is None:
+                continue
+            tensors = kv if isinstance(kv, (tuple, list)) else [kv]
+            real_tensors = [
+                t for t in tensors if isinstance(t, torch.Tensor) and t.numel() > 0
+            ]
+            self._layer_id_tensors.setdefault(lid, []).extend(real_tensors)
+            for t in real_tensors:
+                self._ptr_to_tensor[int(t.data_ptr())] = t
+        logger.info(
+            f"[UCM_DCP_CMP] ptr_to_tensor built: "
+            f"num_entries={len(self._ptr_to_tensor)}, "
+            f"num_layers={len(self._layer_id_tensors)}, "
+            f"tensors_per_layer={[(lid, len(ts)) for lid, ts in sorted(self._layer_id_tensors.items())[:10]]}"
+        )
+        # Grab storage_backends path from connector config for disk reads.
+        if self._checksum_storage_backends:
+            return
+        for cfg in self.connector_configs:
+            backend = cfg.get("ucm_connector_config", {}).get("storage_backends")
+            if backend:
+                self._checksum_storage_backends = [
+                    p for p in backend.split(":")
+                ]
+                break
+
+    def _checksum_find_tensor(self, addr: int, size: int):
+        """Find the tensor whose buffer contains [addr, addr+size)."""
+        for base_ptr, tensor in self._ptr_to_tensor.items():
+            start = base_ptr
+            end = base_ptr + tensor.numel() * tensor.element_size()
+            if start <= addr < end and addr + size <= end:
+                return tensor, addr - start
+        return None, 0
+
+    def _compute_layer_block_checksum(
+        self, vllm_block_id: int, layer_id: int
+    ) -> float:
+        """Compute byte-sum checksum of one vllm block at one layer in HBM.
+
+        Directly indexes the KV cache tensor with vllm_block_id to avoid
+        address arithmetic errors.  For DCP-replicated indexer tensors
+        (shape[0] = num_blocks × dcp_size), the correct row is
+        vllm_block_id × dcp_size (the rank-0 replica that store dumps/loads).
+        """
+        tensors = self._layer_id_tensors.get(layer_id)
+        if not tensors:
+            logger.warning(
+                f"[UCM_DCP_CMP] no tensors for layer={layer_id} "
+                f"vllm_block={vllm_block_id}"
+            )
+            return 0.0
+        num_blocks = self._kv_cache_config.num_blocks
+        dcp_size = getattr(
+            self._vllm_config.parallel_config,
+            "decode_context_parallel_size",
+            1,
+        )
+        total = 0.0
+        for seg, tensor in enumerate(tensors):
+            # Indexer tensors have shape[0] = num_blocks × dcp_size.
+            # Map vllm_block_id to the rank-0 replica row.
+            if dcp_size > 1 and tensor.shape[0] == num_blocks * dcp_size:
+                row_idx = vllm_block_id * dcp_size
+            else:
+                row_idx = vllm_block_id
+            if row_idx >= tensor.shape[0]:
+                continue
+            block = tensor[row_idx].cpu().contiguous()
+            byte_view = block.view(torch.uint8)
+            seg_sum = float(byte_view.sum().item())
+            total += seg_sum
+            logger.info(
+                f"[UCM_DCP_CMP] SEG layer={layer_id} vllm={vllm_block_id} "
+                f"seg={seg} dtype={tensor.dtype} shape={tuple(tensor.shape)} "
+                f"row_idx={row_idx} seg_sum={seg_sum} total={total}"
+            )
+        return total
+
+    def _read_disk_file_checksum(
+        self, ucm_block_id_hex: str, layer_id: int
+    ) -> float | None:
+        """Read one layer's shard from the on-disk file and return byte-sum.
+
+        File layout: <storage_backend>/<shard_dir>/<ucm_block_id_hex>
+        where <shard_dir> is either "data" (dataDirShard disabled) or the
+        first 3 hex chars of the file name (dataDirShard enabled).
+        Within the file, layer L occupies [L*shard_size, (L+1)*shard_size).
+        """
+        if not self._checksum_storage_backends:
+            return None
+        shard_size = getattr(
+            self, "_store_shard_size", self.kv_cache_layout.shard_size
+        )
+        offset = layer_id * shard_size
+        candidate_dirs = ["data", "", ucm_block_id_hex[:3]]
+        for backend in self._checksum_storage_backends:
+            for shard_dir in candidate_dirs:
+                path = os.path.join(backend, shard_dir, ucm_block_id_hex)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    file_size = os.path.getsize(path)
+                    with open(path, "rb") as f:
+                        f.seek(offset)
+                        data = f.read(shard_size)
+                    cs = float(sum(data))
+                    logger.info(
+                        f"[UCM_DCP_CMP] DISK_RAW ucm={ucm_block_id_hex} "
+                        f"layer={layer_id} shard_size={shard_size} "
+                        f"offset={offset} read_bytes={len(data)} "
+                        f"file_size={file_size} cs={cs}"
+                    )
+                    return cs
+                except OSError as e:
+                    logger.warning(
+                        f"[UCM_DCP_CMP] failed to read disk file {path}: {e}"
+                    )
+                    return None
+        return None
+
+    # ── DCP checksum logging entry points ──────────────────────────────
+
+    def _log_dump_checksums(
+        self,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        layer_id: int,
+    ) -> None:
+        """Record HBM checksums right before submit_dump."""
+        if not self._dcp_checksum_enabled:
+            return
+        rank = getattr(self, "dcp_rank", 0)
+        if self._dcp_checksum_rank_filter >= 0 and rank != self._dcp_checksum_rank_filter:
+            return
+        for ucm_id, vllm_id in zip(ucm_block_ids, vllm_block_ids):
+            ucm_hex = ucm_id.hex()
+            cs = self._compute_layer_block_checksum(vllm_id, layer_id)
+            self._dump_checksums[(ucm_hex, layer_id)] = cs
+            logger.info(
+                f"[UCM_DCP_CMP] DUMP layer={layer_id} rank={rank} "
+                f"ucm={ucm_hex} vllm={vllm_id} cs={cs}"
+            )
+
+    def _log_disk_checksums(
+        self,
+        ucm_block_ids: list[bytes],
+        layer_id: int,
+    ) -> None:
+        """Read on-disk file checksums and compare with dump checksums."""
+        if not self._dcp_checksum_enabled:
+            return
+        rank = getattr(self, "dcp_rank", 0)
+        if self._dcp_checksum_rank_filter >= 0 and rank != self._dcp_checksum_rank_filter:
+            return
+        for ucm_id in ucm_block_ids:
+            ucm_hex = ucm_id.hex()
+            file_cs = self._read_disk_file_checksum(ucm_hex, layer_id)
+            dump_cs = self._dump_checksums.get((ucm_hex, layer_id))
+            self._disk_checksums[(ucm_hex, layer_id)] = file_cs
+            if file_cs is not None and dump_cs is not None:
+                match = "MATCH" if file_cs == dump_cs else "MISMATCH"
+                logger.info(
+                    f"[UCM_DCP_CMP] DISK layer={layer_id} rank={rank} "
+                    f"ucm={ucm_hex} file_cs={file_cs} dump_cs={dump_cs} {match}"
+                )
+            else:
+                logger.info(
+                    f"[UCM_DCP_CMP] DISK layer={layer_id} rank={rank} "
+                    f"ucm={ucm_hex} file_cs={file_cs} dump_cs={dump_cs} "
+                    f"SKIP(unavailable)"
+                )
+
+    def _log_load_checksums(
+        self,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+        layer_id: int,
+    ) -> None:
+        """Record HBM checksums right after wait_load and compare with dump."""
+        if not self._dcp_checksum_enabled:
+            return
+        rank = getattr(self, "dcp_rank", 0)
+        if self._dcp_checksum_rank_filter >= 0 and rank != self._dcp_checksum_rank_filter:
+            return
+        num_blocks = self._kv_cache_config.num_blocks
+        dcp_size = getattr(
+            self._vllm_config.parallel_config,
+            "decode_context_parallel_size",
+            1,
+        )
+        for i, (ucm_id, vllm_id) in enumerate(
+            zip(ucm_block_ids, vllm_block_ids)
+        ):
+            ucm_hex = ucm_id.hex()
+            cs = self._compute_layer_block_checksum(vllm_id, layer_id)
+            self._load_checksums[(ucm_hex, layer_id)] = cs
+            dump_cs = self._dump_checksums.get((ucm_hex, layer_id))
+            if dump_cs is not None:
+                match = "MATCH" if cs == dump_cs else "MISMATCH"
+                logger.info(
+                    f"[UCM_DCP_CMP] LOAD layer={layer_id} rank={rank} "
+                    f"ucm={ucm_hex} vllm={vllm_id} cs={cs} "
+                    f"dump_cs={dump_cs} {match}"
+                )
+            else:
+                logger.info(
+                    f"[UCM_DCP_CMP] LOAD layer={layer_id} rank={rank} "
+                    f"ucm={ucm_hex} vllm={vllm_id} cs={cs} "
+                    f"dump_cs=None SKIP(no_dump_baseline)"
+                )
+            # Compare against HBM_ENTRY (the correct HBM-resident value
+            # recorded during a previous HBM-hit step).  Since we only
+            # record when need_load=False, the last element is the most
+            # recent HBM-hit baseline.
+            hbm_entry_list = self._hbm_entry_checksums.get((ucm_hex, layer_id))
+            if hbm_entry_list:
+                hbm_entry_cs = hbm_entry_list[-1]
+                hbm_match = "MATCH" if cs == hbm_entry_cs else "MISMATCH"
+                logger.info(
+                    f"[UCM_DCP_CMP] LOAD_VS_HBM layer={layer_id} rank={rank} "
+                    f"ucm={ucm_hex} vllm={vllm_id} cs={cs} "
+                    f"hbm_entry_cs={hbm_entry_cs} {hbm_match}"
+                )
+            # Extra: check all DCP replicas of indexer tensors after load.
+            if dcp_size > 1:
+                tensors = self._layer_id_tensors.get(layer_id)
+                if tensors:
+                    for seg, tensor in enumerate(tensors):
+                        if tensor.shape[0] != num_blocks * dcp_size:
+                            continue
+                        replica_sums = []
+                        for r in range(dcp_size):
+                            row = vllm_id * dcp_size + r
+                            if row >= tensor.shape[0]:
+                                replica_sums.append(-1.0)
+                                continue
+                            bv = tensor[row].cpu().contiguous().view(torch.uint8)
+                            replica_sums.append(float(bv.sum().item()))
+                        logger.info(
+                            f"[UCM_DCP_CMP] REPLICA layer={layer_id} rank={rank} "
+                            f"ucm={ucm_hex} vllm={vllm_id} seg={seg} "
+                            f"replica_sums={replica_sums}"
+                        )
 
     def _record_layerwise_load_duration(self, layer_id: int, load_end: float) -> bool:
         if layer_id not in self._layerwise_load_start_by_layer:
@@ -2634,6 +2994,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         try:
             layer_ptrs = np.ascontiguousarray(self.dump_total_ptrs[local_layer_id])
             shard_indexs = [layer_id] * len(total_ucm_block_ids)
+            if self._dcp_checksum_enabled:
+                # Synchronize the compute stream so KV data written by this
+                # layer's forward is visible in HBM before we checksum it.
+                torch.npu.synchronize() if hasattr(torch, "npu") else torch.cuda.synchronize()
+                self._log_dump_checksums(
+                    total_ucm_block_ids, total_vllm_block_ids, layer_id
+                )
             event_handle = self._get_dump_event_handle()
             task = self._rank_consistency.submit_dump(
                 self.store,
@@ -2741,6 +3108,19 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             )
 
         if self.need_load:
+            if self._dcp_checksum_enabled:
+                all_load_ucm_ids: list[bytes] = []
+                all_load_layer_ids: list[int] = []
+                for request_id, request in metadata.request_meta.items():
+                    if len(request.load_block_ids[0]) == 0:
+                        continue
+                    for ucm_id in request.load_block_ids[0]:
+                        all_load_ucm_ids.append(ucm_id)
+                if all_load_ucm_ids and self._dump_checksums:
+                    for layer_id in self.layer_ids:
+                        self._log_disk_checksums(
+                            all_load_ucm_ids, layer_id
+                        )
             self._submit_request_load_tasks_for_layer(
                 self.first_layer_id,
                 0,
@@ -2748,7 +3128,47 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 first_layer_load_start,
             )
 
+    def _log_hbm_entry_checksums(self, layer_name: str) -> None:
+        """Print HBM checksum at wait_for_layer_load entry (before any load).
+
+        Uses hbm_check_ids from RequestDispatchMeta so that HBM data can
+        be inspected even on pure HBM-hit steps where load/dump is empty.
+        Only records into _hbm_entry_checksums when this step does NOT
+        need load (i.e. HBM-hit or dump-only steps), so that LOAD_VS_HBM
+        compares against the correct HBM-resident baseline rather than
+        the pre-load state.
+        """
+        if not self._dcp_checksum_enabled:
+            return
+        if not self._connector_metadata:
+            return
+        metadata = self._get_connector_metadata()
+        current_layer_id = self.layer_name_to_id[layer_name]
+        rank = getattr(self, "dcp_rank", 0)
+        if self._dcp_checksum_rank_filter >= 0 and rank != self._dcp_checksum_rank_filter:
+            return
+        # Only record baseline when this step does not need load.
+        record = not self.need_load
+        for request_id, request in metadata.request_meta.items():
+            if len(request.hbm_check_ids[0]) == 0:
+                continue
+            ucm_ids = request.hbm_check_ids[0]
+            vllm_ids = request.hbm_check_ids[1]
+            for ucm_id, vllm_id in zip(ucm_ids, vllm_ids):
+                ucm_hex = ucm_id.hex()
+                cs = self._compute_layer_block_checksum(vllm_id, current_layer_id)
+                if record:
+                    self._hbm_entry_checksums.setdefault(
+                        (ucm_hex, current_layer_id), []
+                    ).append(cs)
+                logger.info(
+                    f"[UCM_DCP_CMP] HBM_ENTRY layer={current_layer_id} rank={rank} "
+                    f"ucm={ucm_hex} vllm={vllm_id} cs={cs} "
+                    f"record={record}"
+                )
+
     def wait_for_layer_load(self, layer_name: str) -> None:
+        self._log_hbm_entry_checksums(layer_name)
         if not self._connector_metadata:
             return
         if not self.need_load:
@@ -2779,6 +3199,15 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                     len(metadata.request_meta[request_id].load_block_ids[0])
                     * self.kv_cache_layout.shard_size
                 )
+
+        if self._dcp_checksum_enabled and layer_tasks:
+            for request_id in layer_tasks:
+                req_meta = metadata.request_meta.get(request_id)
+                if not req_meta or len(req_meta.load_block_ids[0]) == 0:
+                    continue
+                ucm_ids = req_meta.load_block_ids[0]
+                vllm_ids = req_meta.load_block_ids[1]
+                self._log_load_checksums(ucm_ids, vllm_ids, current_layer_id)
 
         wait_end = time.perf_counter()
         load_duration_recorded = self._record_layerwise_load_duration(
