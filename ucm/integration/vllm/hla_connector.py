@@ -71,6 +71,9 @@ class HLARequestMeta(RequestMeta):
 
     group_ucm_block_ids: list[list[bytes]] = field(default_factory=list)
     group_vllm_block_ids: list[list[int]] = field(default_factory=list)
+    group_partial_block_ids: list[dict[int, bytes]] = field(default_factory=list)
+    group_load_keys: dict[int, bytes] = field(default_factory=dict)
+    resume_tokens: int = 0
 
 
 @dataclass
@@ -342,6 +345,9 @@ class GroupInfo:
     is_compressed: bool = False
     is_raw_key: bool = False
     block_hasher: Optional[Callable[["Request"], list[bytes]]] = None
+    hash_chain: Optional[
+        Callable[["Request"], tuple[list[bytes], dict[int, bytes]]]
+    ] = None
     participates_in_prefix_caching: bool = True
 
     @property
@@ -368,6 +374,8 @@ class KVCacheGroupManager:
         kv_cache_config: "KVCacheConfig",
         request_hasher: "RequestHasher",
         base_seed: bytes,
+        prefix_match_unit: int | None = None,
+        enable_partial: bool = False,
     ) -> None:
         self.request_hasher = request_hasher
         self.groups_by_id: list[GroupInfo] = []
@@ -419,6 +427,21 @@ class KVCacheGroupManager:
         cached_groups = self.full_attn_groups + self.state_groups
         all_block_sizes = [g.block_size for g in cached_groups]
         self.lcm_block_size: int = math.lcm(*all_block_sizes)
+        self.prefix_match_unit = prefix_match_unit or self.lcm_block_size
+        self.enable_partial = (
+            enable_partial
+            and self.prefix_match_unit < self.lcm_block_size
+            and self.lcm_block_size % self.prefix_match_unit == 0
+            and all(group.block_size == self.lcm_block_size for group in cached_groups)
+            and all(group.is_mamba_align for group in self.state_groups)
+        )
+        if self.enable_partial:
+            for group in self.full_attn_groups:
+                group.hash_chain = request_hasher.make_request_hash_chain(
+                    group.block_size,
+                    group.seed,
+                    self.prefix_match_unit,
+                )
 
         for g in cached_groups:
             assert self.lcm_block_size % g.block_size == 0, (
@@ -435,6 +458,8 @@ class KVCacheGroupManager:
         logger.info(
             "KVCacheGroupManager initialized: "
             f"lcm_block_size={self.lcm_block_size}, "
+            f"prefix_match_unit={self.prefix_match_unit}, "
+            f"partial_enabled={self.enable_partial}, "
             f"full_attn_groups="
             f"{[(g.group_id, g.block_size) for g in self.full_attn_groups]}, "
             f"state_groups="
@@ -458,35 +483,54 @@ class KVCacheGroupManager:
         assert group.block_hasher is not None
         return group.block_hasher(request)
 
+    def compute_all_group_hashes(
+        self, request: "Request"
+    ) -> tuple[list[list[bytes]], list[dict[int, bytes]]]:
+        full_hashes: list[list[bytes]] = []
+        partial_hashes: list[dict[int, bytes]] = []
+        for group in self.groups_by_id:
+            if group.hash_chain is not None:
+                full, partial = group.hash_chain(request)
+            else:
+                full, partial = self.compute_block_hashes(group, request), {}
+            full_hashes.append(full)
+            partial_hashes.append(partial)
+        return full_hashes, partial_hashes
+
     def compute_all_group_block_ids(self, request: "Request") -> list[list[bytes]]:
         """Compute full block hashes for every group, indexed by group_id."""
-        return [self.compute_block_hashes(g, request) for g in self.groups_by_id]
+        return self.compute_all_group_hashes(request)[0]
 
     def compute_mamba_align_state_hash(
         self,
         group: GroupInfo,
         seq_len: int,
         group_block_ids: list[list[bytes]],
+        group_partial_block_ids: list[dict[int, bytes]] | None = None,
     ) -> Optional[bytes]:
         """Derive the mamba-align state hash at ``seq_len`` from the prefix hash."""
-        if seq_len <= 0 or seq_len % self.lcm_block_size != 0:
+        match_unit = getattr(self, "prefix_match_unit", self.lcm_block_size)
+        if seq_len <= 0 or seq_len % match_unit != 0:
             return None
         primary = self.full_attn_groups[0]
-        prefix_idx = seq_len // primary.block_size - 1
-        if prefix_idx < 0:
-            return None
-        try:
-            prefix_hash = group_block_ids[primary.group_id][prefix_idx]
-        except IndexError:
-            logger.error(
-                "mamba-align state hash missing primary prefix hash: "
-                f"group_id={group.group_id}, seq_len={seq_len}, "
-                f"primary_group_id={primary.group_id}, "
-                f"prefix_idx={prefix_idx}, "
-                f"num_primary_hashes="
-                f"{len(group_block_ids[primary.group_id])}"
-            )
-            return None
+        if seq_len % primary.block_size == 0:
+            prefix_idx = seq_len // primary.block_size - 1
+            try:
+                prefix_hash = group_block_ids[primary.group_id][prefix_idx]
+            except IndexError:
+                logger.error(
+                    "mamba-align state hash missing primary prefix hash: "
+                    f"group_id={group.group_id}, seq_len={seq_len}, "
+                    f"primary_group_id={primary.group_id}, "
+                    f"prefix_idx={prefix_idx}, "
+                    f"num_primary_hashes="
+                    f"{len(group_block_ids[primary.group_id])}"
+                )
+                return None
+        else:
+            if group_partial_block_ids is None:
+                return None
+            prefix_hash = group_partial_block_ids[primary.group_id].get(seq_len)
         if not prefix_hash:
             return None
         return self.request_hasher(
@@ -618,6 +662,114 @@ class KVCacheGroupManager:
             mamba_prefetch_hashes,
         )
 
+    def _lookup_key(
+        self,
+        group: GroupInfo,
+        key: bytes,
+        lookup_on_prefix: Callable[[list[bytes]], int],
+    ) -> bool:
+        try:
+            return bool(key) and lookup_on_prefix([key]) >= 0
+        except Exception as e:
+            logger.error(
+                f"group {group.group_id} key lookup error. {type(e).__name__}: {e}"
+            )
+            _record_counter("connector_lookup_errors_total")
+            return False
+
+    def _full_attention_hit_key(
+        self,
+        group: GroupInfo,
+        boundary: int,
+        group_block_ids: list[list[bytes]],
+        group_partial_block_ids: list[dict[int, bytes]],
+        lookup_on_prefix: Callable[[list[bytes]], int],
+    ) -> bytes | None:
+        group_hashes = group_block_ids[group.group_id]
+        if boundary % group.block_size == 0:
+            full_index = boundary // group.block_size - 1
+            full_key = (
+                group_hashes[full_index] if full_index < len(group_hashes) else None
+            )
+            return (
+                full_key
+                if full_key and self._lookup_key(group, full_key, lookup_on_prefix)
+                else None
+            )
+
+        covering_index = boundary // group.block_size
+        if covering_index < len(group_hashes):
+            full_key = group_hashes[covering_index]
+            if self._lookup_key(group, full_key, lookup_on_prefix):
+                return full_key
+        partial_key = group_partial_block_ids[group.group_id].get(boundary)
+        if partial_key and self._lookup_key(group, partial_key, lookup_on_prefix):
+            return partial_key
+        return None
+
+    def lookup_external_hit(
+        self,
+        num_computed_tokens: int,
+        group_block_ids: list[list[bytes]],
+        group_partial_block_ids: list[dict[int, bytes]],
+        max_hit_tokens: int,
+        lookup_on_prefix: Callable[[list[bytes]], int],
+        lookup_on_reverse: Callable[[list[bytes]], int],
+    ) -> tuple[int, int, list[bytes], dict[int, bytes]]:
+        base_external, base_lcm_blocks, prefetch = self.lookup_external_hit_tokens(
+            num_computed_tokens,
+            group_block_ids,
+            lookup_on_prefix,
+            lookup_on_reverse,
+        )
+        if not self.enable_partial:
+            return base_external, base_lcm_blocks, prefetch, {}
+
+        base_hit = num_computed_tokens + base_external
+        for boundary in range(
+            max_hit_tokens // self.prefix_match_unit * self.prefix_match_unit,
+            base_hit,
+            -self.prefix_match_unit,
+        ):
+            selected: dict[int, bytes] = {}
+            for group in self.full_attn_groups:
+                key = self._full_attention_hit_key(
+                    group,
+                    boundary,
+                    group_block_ids,
+                    group_partial_block_ids,
+                    lookup_on_prefix,
+                )
+                if key is None:
+                    break
+                selected[group.group_id] = key
+            else:
+                for group in self.state_groups:
+                    state_key = self.compute_mamba_align_state_hash(
+                        group,
+                        boundary,
+                        group_block_ids,
+                        group_partial_block_ids,
+                    )
+                    if state_key is None or not self._lookup_key(
+                        group, state_key, lookup_on_prefix
+                    ):
+                        break
+                    selected[group.group_id] = state_key
+                else:
+                    external = boundary - num_computed_tokens
+                    state_keys = [
+                        selected[group.group_id] for group in self.state_groups
+                    ]
+                    return (
+                        external,
+                        external // self.lcm_block_size,
+                        [*prefetch, *state_keys],
+                        selected,
+                    )
+
+        return base_external, base_lcm_blocks, prefetch, {}
+
 
 class HybridLinearAttentionLayout(KVCacheLayout):
     """Per-layer physical layout for hybrid full/linear-attention models.
@@ -677,8 +829,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 origins.append(self._tensor_block0(tensor, offset))
         if not origins:
             raise ValueError(
-                "BLNHC KV tensor has no live layer view: "
-                f"layers={_short_list(names)}"
+                f"BLNHC KV tensor has no live layer view: layers={_short_list(names)}"
             )
         return min(origins)
 
@@ -922,7 +1073,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                 gid = self.layer_name_to_group.get(name)
                 if gid is None:
                     raise ValueError(
-                        "NPU flash-next layer is not in a cache group: " f"{name}"
+                        f"NPU flash-next layer is not in a cache group: {name}"
                     )
                 records.append(
                     {
@@ -1324,8 +1475,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         ]
         if missing:
             raise ValueError(
-                "Cached layers missing from KV cache tensors: "
-                f"{_short_list(missing)}"
+                f"Cached layers missing from KV cache tensors: {_short_list(missing)}"
             )
 
     def _layer_components(
@@ -1384,8 +1534,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
             for stride_dim, shape_dim in packing:
                 if stride_dim != expected_stride:
                     raise ValueError(
-                        f"KV block component is not a dense page: "
-                        f"layer={layer_name}"
+                        f"KV block component is not a dense page: layer={layer_name}"
                     )
                 expected_stride *= shape_dim
             # stride(0) may exceed `inner` legitimately: vllm-ascend
@@ -1675,6 +1824,18 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 kv_cache_config=kv_cache_config,
                 request_hasher=self.request_hasher,
                 base_seed=self._seed,
+                prefix_match_unit=getattr(
+                    vllm_config.cache_config, "prefix_match_unit", None
+                ),
+                enable_partial=(
+                    getattr(
+                        vllm_config.parallel_config,
+                        "decode_context_parallel_size",
+                        1,
+                    )
+                    == 1
+                    and getattr(vllm_config, "speculative_config", None) is None
+                ),
             )
             lcm_block_size = self.group_manager.lcm_block_size
             self.block_size = lcm_block_size
@@ -1754,12 +1915,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             return 0, False
 
         try:
-            group_ucm_block_ids = self.group_manager.compute_all_group_block_ids(
-                request
+            group_ucm_block_ids, group_partial_block_ids = (
+                self.group_manager.compute_all_group_hashes(request)
             )
         except Exception as e:
             logger.error(
-                f"request {request.request_id} hash error. " f"{type(e).__name__}: {e}"
+                f"request {request.request_id} hash error. {type(e).__name__}: {e}"
             )
             return 0, False
         primary_full_attn = self.group_manager.full_attn_groups[0]
@@ -1784,17 +1945,22 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         else:
             lookup_block_ids = group_ucm_block_ids
 
-        external_hit_tokens, external_hit_lcm_blocks, mamba_prefetch_hashes = (
-            self.group_manager.lookup_external_hit_tokens(
-                num_computed_tokens,
-                lookup_block_ids,
-                lambda block_ids: self._rank_consistency.lookup_on_prefix(
-                    self.store, block_ids
-                ),
-                lambda block_ids: self._rank_consistency.lookup_on_reverse(
-                    self.store, block_ids
-                ),
-            )
+        (
+            external_hit_tokens,
+            _external_hit_lcm_blocks,
+            mamba_prefetch_hashes,
+            group_load_keys,
+        ) = self.group_manager.lookup_external_hit(
+            num_computed_tokens,
+            lookup_block_ids,
+            group_partial_block_ids,
+            max(0, request.num_tokens - recompute_tokens),
+            lambda block_ids: self._rank_consistency.lookup_on_prefix(
+                self.store, block_ids
+            ),
+            lambda block_ids: self._rank_consistency.lookup_on_reverse(
+                self.store, block_ids
+            ),
         )
 
         if (
@@ -1810,41 +1976,41 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 f"ucm_block_ids: {hex_block_ids}"
             )
 
-        total_hit_block_num = hbm_hit_block_num + external_hit_lcm_blocks
+        resume_tokens = num_computed_tokens + external_hit_tokens
+        total_hit_block_num = resume_tokens // lcm_block_size
 
         # GC heat update for all hit blocks across ranks.
-        total_hit_tokens = total_hit_block_num * lcm_block_size
+        total_hit_full_attn = (
+            resume_tokens + primary_full_attn.block_size - 1
+        ) // primary_full_attn.block_size
         hbm_hit_full_attn = num_computed_tokens // primary_full_attn.block_size
-        total_hit_full_attn = total_hit_tokens // primary_full_attn.block_size
-        all_hit_full_attn = primary_block_ids[0:total_hit_full_attn]
-        hbm_full_attn = primary_block_ids[0:hbm_hit_full_attn]
-        # MLA full-attn is TP-replicated (shared hash), no per-rank entries to prefetch.
-        # Only mamba blocks have per-rank entries needing heat update.
-        per_rank_hashes = mamba_prefetch_hashes
+        all_hit_full_attn = primary_block_ids[:total_hit_full_attn]
+        hbm_full_attn = primary_block_ids[:hbm_hit_full_attn]
+        selected_full_attn = [
+            key
+            for gid, key in group_load_keys.items()
+            if gid in {group.group_id for group in self.group_manager.full_attn_groups}
+            and key not in all_hit_full_attn
+        ]
+        per_rank_hashes = [*mamba_prefetch_hashes, *selected_full_attn]
         if not self.is_mla:
-            per_rank_hashes = all_hit_full_attn + mamba_prefetch_hashes
-        # Use the base connector's best-effort hotness update. It refreshes
-        # rank 0 as well as other ranks and isolates prefetch failures.
+            per_rank_hashes.extend(all_hit_full_attn)
         self._prefetch_direct_hit_key_hotness(hbm_full_attn, per_rank_hashes)
 
-        if len(primary_block_ids) > 0:
+        if primary_block_ids:
             ucmmetrics.update_stats(
                 {
-                    "interval_lookup_hit_rates": external_hit_lcm_blocks
-                    * lcm_block_size
+                    "interval_lookup_hit_rates": external_hit_tokens
                     / (len(primary_block_ids) * primary_full_attn.block_size)
                 },
             )
-
-        # No post-lookup workaround needed: pre-lookup truncation already
-        # ensures the mamba state at total_hit_tokens is verified.
-        num_total_hit_tokens = total_hit_block_num * lcm_block_size
 
         logger.info_once(
             f"request_id: {request.request_id}, "
             f"total_lcm_blocks: {request.num_tokens // lcm_block_size}, "
             f"hit hbm: {hbm_hit_block_num}, "
-            f"hit external: {total_hit_block_num - hbm_hit_block_num}, "
+            f"hit external: {external_hit_tokens}, "
+            f"resume_tokens: {resume_tokens}, "
             f"total_tokens: {len(request.all_token_ids)}"
         )
 
@@ -1853,9 +2019,12 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             hbm_hit_block_num=hbm_hit_block_num,
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
-            token_processed=num_total_hit_tokens,
+            token_processed=resume_tokens,
             group_ucm_block_ids=group_ucm_block_ids,
             group_vllm_block_ids=[[] for _ in range(self.group_manager.num_groups)],
+            group_partial_block_ids=group_partial_block_ids,
+            group_load_keys=group_load_keys,
+            resume_tokens=resume_tokens,
         )
 
         return external_hit_tokens, False
@@ -1886,44 +2055,52 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         seq_len: int,
         reason: str,
         num_scheduled_tokens: int = 0,
+        source_block_id: int | None = None,
     ) -> None:
         group = self.group_manager.groups_by_id[gid]
         state_idx = max((seq_len - 1) // group.block_size, 0)
         state_indices = [state_idx]
         if reason == "load":
-            # External-hit restoration: restore the checkpoint slot for
-            # later prefix reuse and seed the worker-selected running slot
-            # for the upcoming computation (do not pick speculative or
-            # over-allocated table-tail slots).
             running_state_idx = max(
                 (seq_len + num_scheduled_tokens - 1) // group.block_size, 0
             )
-            # Match the worker's running position; table-tail blocks may be
-            # speculative scratch slots or left over from over-allocation.
             state_indices.append(running_state_idx)
 
         block_ids = req_meta.group_vllm_block_ids[gid]
-        vllm_block_ids: list[int] = []
-        for vllm_state_idx in state_indices:
-            try:
-                vllm_block_id = block_ids[vllm_state_idx]
-            except IndexError:
-                logger.error(
-                    "HLA mamba-align state vLLM block missing: "
-                    f"request_id={request_id}, group_id={gid}, reason={reason}, "
-                    f"seq_len={seq_len}, state_idx={state_idx}, "
-                    f"vllm_state_idx={vllm_state_idx}, "
-                    f"num_vllm_blocks={len(block_ids)}"
-                )
-                return
-            if vllm_block_id != 0 and vllm_block_id not in vllm_block_ids:
-                vllm_block_ids.append(vllm_block_id)
+        if source_block_id is not None:
+            vllm_block_ids = [source_block_id] if source_block_id != 0 else []
+        else:
+            vllm_block_ids: list[int] = []
+            for vllm_state_idx in state_indices:
+                try:
+                    vllm_block_id = block_ids[vllm_state_idx]
+                except IndexError:
+                    logger.error(
+                        "HLA mamba-align state vLLM block missing: "
+                        f"request_id={request_id}, group_id={gid}, reason={reason}, "
+                        f"seq_len={seq_len}, state_idx={state_idx}, "
+                        f"vllm_state_idx={vllm_state_idx}, "
+                        f"num_vllm_blocks={len(block_ids)}"
+                    )
+                    return
+                if vllm_block_id != 0 and vllm_block_id not in vllm_block_ids:
+                    vllm_block_ids.append(vllm_block_id)
         if not vllm_block_ids:
             return
 
-        ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
-            group, seq_len, req_meta.group_ucm_block_ids
-        )
+        ucm_block_id = req_meta.group_load_keys.get(gid) if reason == "load" else None
+        if ucm_block_id is None:
+            if req_meta.group_partial_block_ids:
+                ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
+                    group,
+                    seq_len,
+                    req_meta.group_ucm_block_ids,
+                    req_meta.group_partial_block_ids,
+                )
+            else:
+                ucm_block_id = self.group_manager.compute_mamba_align_state_hash(
+                    group, seq_len, req_meta.group_ucm_block_ids
+                )
         if ucm_block_id is None:
             logger.error(
                 "HLA mamba-align state hash missing: "
@@ -1944,12 +2121,15 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         need_load: bool = True,
         request_id: str = "",
         incoming_block_ids_are_full: bool = False,
+        boundary_state_offloads: tuple[tuple[int, int, int], ...] = (),
     ) -> HLARequestDispatchMeta:
-        """Build a flat (ucm, vllm) block id pair list across all groups."""
+        """Build load/dump pairs at full-block and partial-tail boundaries."""
         assert self.group_manager is not None
         groups_by_id = self.group_manager.groups_by_id
         num_groups = self.group_manager.num_groups
         lcm_block_size = self.group_manager.lcm_block_size
+        match_unit = getattr(self.group_manager, "prefix_match_unit", lcm_block_size)
+        enable_partial = getattr(self.group_manager, "enable_partial", False)
 
         assert len(new_vllm_block_ids_per_group) == num_groups, (
             f"new_vllm_block_ids_per_group length "
@@ -1975,23 +2155,18 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         dump_vllm_block_ids: list[int] = []
         dump_group_ids: list[int] = []
 
-        external_hit_lcm_blocks = (
-            req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
-        )
         hbm_hit_tokens = req_meta.hbm_hit_block_num * lcm_block_size
-        total_hit_tokens = req_meta.total_hit_block_num * lcm_block_size
+        total_hit_tokens = (
+            req_meta.resume_tokens or req_meta.total_hit_block_num * lcm_block_size
+        )
+        external_hit_tokens = total_hit_tokens - hbm_hit_tokens
 
-        if need_load and external_hit_lcm_blocks > 0:
-            # Pass 1: full-attention blocks first (for MLA rank-0-only dump)
+        if need_load and external_hit_tokens > 0:
             for gid, group in enumerate(groups_by_id):
                 if not group.is_full_attention:
                     continue
-                load_tok_start = hbm_hit_tokens
-                load_tok_end = total_hit_tokens
-                start_blk = load_tok_start // group.block_size
-                end_blk = load_tok_end // group.block_size
-                if start_blk >= end_blk:
-                    continue
+                start_blk = hbm_hit_tokens // group.block_size
+                end_blk = total_hit_tokens // group.block_size
                 extend_non_null(
                     load_ucm_block_ids,
                     load_vllm_block_ids,
@@ -2000,8 +2175,23 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
                     gid,
                 )
+                if total_hit_tokens % group.block_size != 0:
+                    load_key = req_meta.group_load_keys.get(gid)
+                    if load_key is None:
+                        load_key = req_meta.group_partial_block_ids[gid].get(
+                            total_hit_tokens
+                        )
+                    if load_key is None:
+                        load_key = req_meta.group_ucm_block_ids[gid][end_blk]
+                    extend_non_null(
+                        load_ucm_block_ids,
+                        load_vllm_block_ids,
+                        load_group_ids,
+                        [load_key],
+                        [req_meta.group_vllm_block_ids[gid][end_blk]],
+                        gid,
+                    )
             load_full_attn_count = len(load_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba and PLE state blocks
             for gid, group in enumerate(groups_by_id):
                 if not group.is_state_hash:
                     continue
@@ -2024,17 +2214,17 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_tok_end = min(
                 req_meta.token_processed + new_tokens, req_meta.num_token_ids
             )
-            first_lcm_b = (dump_tok_start // lcm_block_size + 1) * lcm_block_size
             last_lcm_b = (dump_tok_end // lcm_block_size) * lcm_block_size
+            boundary_sources = {
+                (gid, boundary): block_id
+                for gid, block_id, boundary in boundary_state_offloads
+            }
 
-            # Pass 1: full-attention blocks first
             for gid, group in enumerate(groups_by_id):
                 if not group.is_full_attention:
                     continue
                 start_blk = dump_tok_start // group.block_size
                 end_blk = dump_tok_end // group.block_size
-                if start_blk >= end_blk:
-                    continue
                 extend_non_null(
                     dump_ucm_block_ids,
                     dump_vllm_block_ids,
@@ -2043,14 +2233,34 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
                     gid,
                 )
+                is_partial_tail = (
+                    enable_partial
+                    and dump_tok_end % group.block_size != 0
+                    and dump_tok_end % match_unit == 0
+                    and dump_tok_end
+                    == req_meta.num_token_ids // match_unit * match_unit
+                )
+                if is_partial_tail:
+                    extend_non_null(
+                        dump_ucm_block_ids,
+                        dump_vllm_block_ids,
+                        dump_group_ids,
+                        [req_meta.group_partial_block_ids[gid][dump_tok_end]],
+                        [req_meta.group_vllm_block_ids[gid][end_blk]],
+                        gid,
+                    )
             dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
-            # Pass 2: mamba and PLE state only when this step ends exactly on
-            # an LCM boundary. The state at last_lcm_b is then the running
-            # state. A step that merely crosses a boundary leaves that slot
-            # overwritten by the partial block, so it is not dumped.
-            if dump_tok_end == last_lcm_b and last_lcm_b >= first_lcm_b:
+            if dump_tok_end % match_unit == 0:
                 for gid, group in enumerate(groups_by_id):
                     if not group.is_state_hash:
+                        continue
+                    source_block_id = boundary_sources.get((gid, dump_tok_end))
+                    if dump_tok_end != last_lcm_b and source_block_id is None:
+                        logger.warning(
+                            "Skip partial-tail state without exact source block: "
+                            f"request_id={request_id}, group_id={gid}, "
+                            f"boundary={dump_tok_end}"
+                        )
                         continue
                     self._append_mamba_align_state_block(
                         dump_ucm_block_ids,
@@ -2059,8 +2269,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                         req_meta,
                         request_id,
                         gid,
-                        last_lcm_b,
+                        dump_tok_end,
                         "dump",
+                        source_block_id=source_block_id,
                     )
         else:
             dump_full_attn_count = 0
@@ -2082,6 +2293,23 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         assert self.group_manager is not None
         num_groups = self.group_manager.num_groups
         empty_per_group: tuple[list[int], ...] = tuple([] for _ in range(num_groups))
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+
+        def dispatch_kwargs(request_id: str) -> dict:
+            boundary_state_offloads = ()
+            if block_state is not None:
+                boundary_state_offloads = tuple(
+                    block_state.boundary_state_offloads.get(request_id, ())
+                )
+            return {
+                "request_id": request_id,
+                "boundary_state_offloads": boundary_state_offloads,
+            }
+
+        def current_block_ids(request_id: str):
+            if block_state is not None:
+                return block_state.get_block_ids(request_id)
+            return None
 
         requests_dispatch_meta: dict[str, HLARequestDispatchMeta] = {}
 
@@ -2091,16 +2319,15 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             if req_meta is None:
                 continue
             assert isinstance(req_meta, HLARequestMeta)
+            block_ids = current_block_ids(request_id) or request.block_ids
             requests_dispatch_meta[request_id] = self._generate_hla_dispatch_meta(
                 req_meta,
                 scheduler_output.num_scheduled_tokens[request_id],
-                request.block_ids,
-                request_id=request_id,
+                block_ids,
                 incoming_block_ids_are_full=True,
+                **dispatch_kwargs(request_id),
             )
 
-        # Same three situations as the parent: chunked prefill (dump only),
-        # resumed (load + dump), decode (no-op).
         scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
         if not isinstance(scheduled_cached_reqs, list):
             for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
@@ -2108,7 +2335,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 if req_meta is None:
                     continue
                 assert isinstance(req_meta, HLARequestMeta)
-                raw_new_block_ids = scheduled_cached_reqs.new_block_ids[i]
+                raw_new_block_ids = current_block_ids(request_id)
+                if raw_new_block_ids is None:
+                    raw_new_block_ids = scheduled_cached_reqs.new_block_ids[i]
                 new_block_ids = (
                     empty_per_group if raw_new_block_ids is None else raw_new_block_ids
                 )
@@ -2125,8 +2354,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     scheduler_output.num_scheduled_tokens[request_id],
                     new_block_ids,
                     resumed_from_preemption,
-                    request_id=request_id,
-                    incoming_block_ids_are_full=resumed_from_preemption,
+                    incoming_block_ids_are_full=(
+                        resumed_from_preemption
+                        or current_block_ids(request_id) is not None
+                    ),
+                    **dispatch_kwargs(request_id),
                 )
         else:
             for request in scheduled_cached_reqs:
@@ -2135,13 +2367,16 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 if req_meta is None:
                     continue
                 assert isinstance(req_meta, HLARequestMeta)
+                block_ids = current_block_ids(request_id)
                 requests_dispatch_meta[request_id] = self._generate_hla_dispatch_meta(
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
-                    request.new_block_ids,
+                    block_ids or request.new_block_ids,
                     request.resumed_from_preemption,
-                    request_id=request_id,
-                    incoming_block_ids_are_full=request.resumed_from_preemption,
+                    incoming_block_ids_are_full=(
+                        request.resumed_from_preemption or block_ids is not None
+                    ),
+                    **dispatch_kwargs(request_id),
                 )
 
         for request_id in scheduler_output.finished_req_ids:

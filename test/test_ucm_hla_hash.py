@@ -115,3 +115,46 @@ def test_hash_failure_in_any_group_disables_whole_lookup_without_partial_keys():
     with pytest.raises(RequestHashError):
         manager.compute_all_group_block_ids(request)
     assert attempted["n"] == 1
+
+
+def _tail_request(identifier, token_ids):
+    request = _request(identifier)
+    request.all_token_ids = list(token_ids)
+    return request
+
+
+def test_hash_chain_continues_full_blocks_with_partial_tail():
+    hasher = RequestHasher("partial-hash-test")
+    hash_chain = hasher.make_request_hash_chain(4, partial_block_size=2)
+    request = _tail_request("image", range(7))
+
+    full, partial = hash_chain(request)
+    changed_tokens = _tail_request("image", [0, 1, 2, 3, 4, 99, 6])
+    changed_full, changed_partial = hash_chain(changed_tokens)
+    changed_image_full, changed_image_partial = hash_chain(
+        _tail_request("other-image", range(7))
+    )
+
+    assert full == hasher.make_request_block_hasher(4)(request)
+    assert set(partial) == {6}
+    assert changed_full == full
+    assert changed_partial[6] != partial[6]
+    assert changed_image_full == full
+    assert changed_image_partial[6] != partial[6]
+
+
+def test_mamba_state_hash_uses_partial_attention_hash():
+    manager, state_group = _manager_with_groups([4])
+    manager.prefix_match_unit = 2
+    attention_group = manager.full_attn_groups[0]
+    hash_chain = manager.request_hasher.make_request_hash_chain(
+        4, attention_group.seed, 2
+    )
+
+    def state_at_six(identifier):
+        full, partial = hash_chain(_tail_request(identifier, range(7)))
+        return manager.compute_mamba_align_state_hash(
+            state_group, 6, [full, [b""]], [partial, {}]
+        )
+
+    assert state_at_six("image") != state_at_six("other-image")

@@ -121,23 +121,32 @@ class RequestHasher:
         h = hashlib.md5(self.meta_bytes + input_bytes)
         return h.digest()
 
-    def make_request_block_hasher(
+    def make_request_hash_chain(
         self,
         block_size: int,
         initial_hash: bytes | None = None,
-    ) -> Callable[["Request"], list[bytes]]:
-        """Bind a reusable request hasher to one block size and chain root."""
+        partial_block_size: int | None = None,
+    ) -> Callable[["Request"], tuple[list[bytes], dict[int, bytes]]]:
+        """Build full-block hashes and, optionally, hashes in the partial tail."""
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}.")
+        if partial_block_size is not None and (
+            partial_block_size <= 0 or block_size % partial_block_size != 0
+        ):
+            raise ValueError(
+                f"block_size={block_size} must be divisible by "
+                f"partial_block_size={partial_block_size}."
+            )
 
         root = self.seed if initial_hash is None else initial_hash
 
-        def hash_request(request: "Request") -> list[bytes]:
+        def hash_request(request: "Request") -> tuple[list[bytes], dict[int, bytes]]:
             _validate_request_hash_semantics(request)
             token_ids = request.all_token_ids
             parent = root
             curr_mm_idx = 0
             block_hashes: list[bytes] = []
+            partial_hashes: dict[int, bytes] = {}
 
             for start in range(0, len(token_ids), block_size):
                 end = start + block_size
@@ -159,7 +168,44 @@ class RequestHasher:
                 )
                 block_hashes.append(parent)
 
-            return block_hashes
+            if partial_block_size is not None:
+                tail_end = len(token_ids) // partial_block_size * partial_block_size
+                for start in range(
+                    len(block_hashes) * block_size,
+                    tail_end,
+                    partial_block_size,
+                ):
+                    end = start + partial_block_size
+                    extra_keys, curr_mm_idx = _generate_extra_keys(
+                        request,
+                        start,
+                        end,
+                        curr_mm_idx,
+                    )
+                    parent = self(
+                        (
+                            b"UCM_PARTIAL_BLOCK_V1",
+                            parent,
+                            tuple(token_ids[start:end]),
+                            extra_keys,
+                        )
+                    )
+                    partial_hashes[end] = parent
+
+            return block_hashes, partial_hashes
+
+        return hash_request
+
+    def make_request_block_hasher(
+        self,
+        block_size: int,
+        initial_hash: bytes | None = None,
+    ) -> Callable[["Request"], list[bytes]]:
+        """Bind a reusable request hasher to one block size and chain root."""
+        hash_chain = self.make_request_hash_chain(block_size, initial_hash)
+
+        def hash_request(request: "Request") -> list[bytes]:
+            return hash_chain(request)[0]
 
         return hash_request
 

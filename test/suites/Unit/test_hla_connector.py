@@ -90,7 +90,13 @@ def hla():
             "__init__",
             "num_groups",
             "compute_block_hashes",
+            "compute_all_group_hashes",
             "compute_all_group_block_ids",
+            "compute_mamba_align_state_hash",
+            "lookup_external_hit_tokens",
+            "_lookup_key",
+            "_full_attention_hit_key",
+            "lookup_external_hit",
         },
         "HybridLinearAttentionLayout": {
             "_tokens_per_state",
@@ -197,9 +203,11 @@ def hla():
         ast.Module(body=[future, *nodes], type_ignores=[])
     )
     exec(compile(module, str(HLA_PATH), "exec"), namespace)
-    namespace["UCMHybridLinearAttentionLayerWiseConnector"]._mark_load_failed = (
-        namespace["UCMHybridLinearAttentionConnector"]._mark_load_failed
-    )
+    namespace[
+        "UCMHybridLinearAttentionLayerWiseConnector"
+    ]._mark_load_failed = namespace[
+        "UCMHybridLinearAttentionConnector"
+    ]._mark_load_failed
     return SimpleNamespace(**namespace)
 
 
@@ -1263,3 +1271,287 @@ def test_layerwise_non_full_keeps_depth2_prefetch(hla, cudagraph_mode):
     assert submitted == [0, 1]
     assert drained == []
     connector._record_load_bytes.assert_not_called()
+
+
+def _partial_dispatch_connector(hla):
+    connector = hla.UCMHybridLinearAttentionConnector()
+    connector.is_mla = False
+    connector.group_manager = SimpleNamespace(
+        num_groups=2,
+        lcm_block_size=896,
+        prefix_match_unit=128,
+        enable_partial=True,
+        groups_by_id=[
+            SimpleNamespace(
+                block_size=896,
+                is_full_attention=True,
+                is_mamba_align=False,
+                is_state_hash=False,
+            ),
+            SimpleNamespace(
+                block_size=896,
+                is_full_attention=False,
+                is_mamba_align=True,
+                is_state_hash=True,
+            ),
+        ],
+        compute_mamba_align_state_hash=MagicMock(
+            side_effect=lambda group, seq_len, full, partial=None: (
+                f"state@{seq_len}".encode()
+            )
+        ),
+    )
+    return connector
+
+
+def _partial_dispatch_meta(hla, *, hit=640, total=1200):
+    return hla.HLARequestMeta(
+        hbm_hit_block_num=0,
+        total_hit_block_num=0,
+        resume_tokens=hit,
+        num_token_ids=total,
+        token_processed=hit,
+        group_ucm_block_ids=[[b"kv@896", b"kv@1792"], []],
+        group_vllm_block_ids=[[11, 12], [21, 22, 99]],
+        group_partial_block_ids=[{640: b"kv@640", 1024: b"kv@1024"}, {}],
+        group_load_keys={0: b"kv@640", 1: b"state@640"},
+    )
+
+
+@pytest.mark.parametrize(
+    "scheduled,expected_state_blocks",
+    [(256, [21]), (384, [21, 22])],
+)
+def test_partial_hit_loads_checkpoint_and_current_running_slots(
+    hla, scheduled, expected_state_blocks
+):
+    connector = _partial_dispatch_connector(hla)
+    req_meta = _partial_dispatch_meta(hla)
+
+    dispatch = connector._generate_hla_dispatch_meta(
+        req_meta, scheduled, ([], []), request_id="req"
+    )
+
+    assert dispatch.load_block_ids == (
+        [b"kv@640", *([b"state@640"] * len(expected_state_blocks))],
+        [11, *expected_state_blocks],
+    )
+    assert dispatch.load_group_ids == [0, *([1] * len(expected_state_blocks))]
+    assert 99 not in dispatch.load_block_ids[1]
+
+
+def test_load_key_is_not_reused_for_later_full_block_dump(hla):
+    connector = _partial_dispatch_connector(hla)
+    req_meta = _partial_dispatch_meta(hla)
+
+    dispatch = connector._generate_hla_dispatch_meta(
+        req_meta, 256, ([], []), request_id="req"
+    )
+
+    assert dispatch.dump_block_ids == ([b"kv@896", b"state@896"], [11, 21])
+    assert b"state@640" not in dispatch.dump_block_ids[0]
+
+
+def test_partial_tail_dump_uses_exact_boundary_source(hla):
+    connector = _partial_dispatch_connector(hla)
+    req_meta = _partial_dispatch_meta(hla, hit=0, total=1024)
+
+    dispatch = connector._generate_hla_dispatch_meta(
+        req_meta,
+        1024,
+        ([], []),
+        need_load=False,
+        request_id="req",
+        boundary_state_offloads=((1, 77, 1024),),
+    )
+
+    assert dispatch.dump_block_ids == (
+        [b"kv@896", b"kv@1024", b"state@1024"],
+        [11, 12, 77],
+    )
+    assert dispatch.dump_group_ids == [0, 0, 1]
+
+
+def test_partial_tail_without_exact_boundary_source_does_not_dump_state(hla):
+    connector = _partial_dispatch_connector(hla)
+    req_meta = _partial_dispatch_meta(hla, hit=0, total=1024)
+
+    dispatch = connector._generate_hla_dispatch_meta(
+        req_meta, 1024, ([], []), need_load=False, request_id="req"
+    )
+
+    assert dispatch.dump_block_ids == ([b"kv@896", b"kv@1024"], [11, 12])
+
+
+def test_build_connector_meta_uses_current_tables_and_boundary_offloads(hla):
+    connector = _partial_dispatch_connector(hla)
+    req_meta = _partial_dispatch_meta(hla, total=1024)
+    connector.requests_meta = {"req": req_meta}
+    tables = ([11, 12], [21, 22, 99])
+    block_state = SimpleNamespace(
+        boundary_state_offloads={"req": [(1, 77, 1024)]},
+        get_block_ids=MagicMock(return_value=tables),
+    )
+    output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="req", block_ids=([999, 998], [997, 996]))
+        ],
+        scheduled_cached_reqs=[],
+        num_scheduled_tokens={"req": 384},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        kv_connector_block_state=block_state,
+    )
+
+    dispatch = connector.build_connector_meta(output).request_meta["req"]
+
+    assert dispatch.load_block_ids == (
+        [b"kv@640", b"state@640", b"state@640"],
+        [11, 21, 22],
+    )
+    assert dispatch.dump_block_ids == (
+        [b"kv@896", b"kv@1024", b"state@1024"],
+        [11, 12, 77],
+    )
+    block_state.get_block_ids.assert_called_with("req")
+    assert req_meta.group_vllm_block_ids == [list(group) for group in tables]
+
+
+def _partial_lookup_manager(hla):
+    manager = hla.KVCacheGroupManager.__new__(hla.KVCacheGroupManager)
+    manager.request_hasher = MagicMock(side_effect=lambda value: repr(value).encode())
+    full_group = hla.GroupInfo(
+        group_id=0,
+        block_size=8,
+        layer_names=("attn",),
+        seed=b"attn",
+    )
+    state_group = hla.GroupInfo(
+        group_id=1,
+        block_size=8,
+        layer_names=("mamba",),
+        seed=b"mamba",
+        is_mamba_align=True,
+    )
+    manager.groups_by_id = [full_group, state_group]
+    manager.full_attn_groups = [full_group]
+    manager.state_groups = [state_group]
+    manager.lcm_block_size = 8
+    manager.prefix_match_unit = 2
+    manager.enable_partial = True
+    full_hashes = [[], [b""]]
+    partial_hashes = [{2: b"kv@2", 4: b"kv@4", 6: b"kv@6"}, {}]
+    return manager, state_group, full_hashes, partial_hashes
+
+
+def test_partial_lookup_falls_back_to_newest_complete_boundary(hla):
+    manager, state_group, full, partial = _partial_lookup_manager(hla)
+    state_key = manager.compute_mamba_align_state_hash(state_group, 4, full, partial)
+    available = {b"kv@4", state_key}
+
+    result = manager.lookup_external_hit(
+        0,
+        full,
+        partial,
+        6,
+        lambda keys: 0 if keys[0] in available else -1,
+        lambda keys: -1,
+    )
+
+    assert result[0] == 4
+    assert result[3] == {0: b"kv@4", 1: state_key}
+
+
+def test_partial_lookup_can_use_full_record_covering_tail(hla):
+    manager, state_group, full, partial = _partial_lookup_manager(hla)
+    full[0].append(b"kv@8")
+    state_key = manager.compute_mamba_align_state_hash(state_group, 6, full, partial)
+    available = {b"kv@8", state_key}
+
+    result = manager.lookup_external_hit(
+        0,
+        full,
+        partial,
+        6,
+        lambda keys: 0 if keys[0] in available else -1,
+        lambda keys: -1,
+    )
+
+    assert result[0] == 6
+    assert result[3] == {0: b"kv@8", 1: state_key}
+
+
+@pytest.fixture
+def request_hasher():
+    import hashlib
+    import pickle
+
+    path = ROOT / "ucm/integration/vllm/request_hasher.py"
+    names = {
+        "RequestHasher",
+        "_request_has_extra_hash_semantics",
+        "_validate_request_hash_semantics",
+        "_generate_extra_keys",
+    }
+    nodes = [
+        node
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if getattr(node, "name", None) in names
+    ]
+
+    def extra_keys(request, start, end, start_mm_idx):
+        features = [
+            feature
+            for feature in request.mm_features
+            if feature.mm_position.offset < end
+        ]
+        return tuple(feature.identifier for feature in features), len(features)
+
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=[future, *nodes], type_ignores=[])
+    )
+    namespace = {
+        "hashlib": hashlib,
+        "pickle": pickle,
+        "Callable": Callable,
+        "generate_block_hash_extra_keys": extra_keys,
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace["RequestHasher"]("partial-hash-test")
+
+
+def _hasher_request(identifier, token_ids):
+    return SimpleNamespace(
+        all_token_ids=list(token_ids),
+        mm_features=[
+            SimpleNamespace(
+                identifier=identifier,
+                mm_position=SimpleNamespace(offset=4, length=3),
+            )
+        ],
+        lora_request=None,
+        cache_salt=None,
+        prompt_embeds=None,
+    )
+
+
+def test_partial_hash_chain_extends_full_hash(request_hasher):
+    hash_chain = request_hasher.make_request_hash_chain(4, partial_block_size=2)
+    request = _hasher_request("image", range(7))
+    full, partial = hash_chain(request)
+    changed_full, changed_partial = hash_chain(
+        _hasher_request("image", [0, 1, 2, 3, 4, 99, 6])
+    )
+    other_image_full, other_image_partial = hash_chain(
+        _hasher_request("other-image", range(7))
+    )
+
+    assert full == request_hasher.make_request_block_hasher(4)(request)
+    assert set(partial) == {6}
+    assert changed_full == full
+    assert changed_partial[6] != partial[6]
+    assert other_image_full == full
+    assert other_image_partial[6] != partial[6]
